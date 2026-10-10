@@ -27,6 +27,9 @@ use uuid::Uuid;
 
 #[derive(Default)]
 struct Mock {
+    use_second_course: AtomicBool,
+    no_open_tasks: AtomicBool,
+    task_queries: AtomicUsize,
     submissions: AtomicUsize,
     sends: AtomicUsize,
     done: AtomicBool,
@@ -35,6 +38,7 @@ struct Mock {
     expire_credentials: AtomicBool,
     incoming_context: RwLock<Option<String>>,
     sent_client_ids: Mutex<Vec<String>>,
+    sent_texts: Mutex<Vec<String>>,
     school_scan_ready: AtomicBool,
     school_requires_wechat: AtomicBool,
     school_uid: RwLock<String>,
@@ -49,8 +53,10 @@ async fn mock_server(mock: Arc<Mock>) -> (String, tokio::task::JoinHandle<()>) {
         .route("/fields/login/student/43",post(school_identity))
         .route("/qr/weixin/student/43",get(school_qr))
         .route("/student/uidlogin",get(school_uid_login))
-        .route("/student/course/12/punchs",get(||async {Html("<div class='punch-card'><a href='/student/punchw/course/12/99?sid=4'>正在进行的签到</a></div>")}))
+        .route("/student/course/12/punchs",get(punch_list))
         .route("/student/punchw/course/12/99",get(punch_state).post(submit))
+        .route("/student/course/15/punchs",get(||async {Html("<div class='punch-card'><div class='font-weight-bold'>大学英语签到</div><a href='/student/punchw/course/15/100?sid=4'>点此去完成签到</a></div>")}))
+        .route("/student/punchw/course/15/100",get(punch_state).post(submit))
         .route("/ilink/bot/get_bot_qrcode",post(qr))
         .route("/ilink/bot/get_qrcode_status",get(qr_status))
         .route("/ilink/bot/getupdates",post(updates))
@@ -88,19 +94,21 @@ async fn student(
     );
     (
         response,
-        Html(
-            "用户中心 我加入的 <div data-student-name='张三' data-student-no='2026001'></div><a href='/student/course/12/punchs'>测试课程</a>",
-        ),
+        Html(if mock.use_second_course.load(Ordering::SeqCst) {
+            "用户中心 我加入的 <div data-student-name='张三' data-student-no='2026001'></div><a href='/student/course/15/punchs'>当前课程</a>"
+        } else {
+            "用户中心 我加入的 <div data-student-name='张三' data-student-no='2026001'></div><a href='/student/course/12/punchs'>测试课程</a>"
+        }),
     )
 }
 
-fn captcha_session(headers: &HeaderMap) {
+fn captcha_session(headers: &HeaderMap, nonce: &str) {
     assert!(
         headers
             .get("cookie")
             .and_then(|h| h.to_str().ok())
             .unwrap_or_default()
-            .contains("captcha_session=school-nonce")
+            .contains(&format!("captcha_session={nonce}"))
     );
 }
 async fn school_captcha() -> Response {
@@ -110,7 +118,7 @@ async fn school_captcha() -> Response {
             ("content-type", "image/png"),
             (
                 "set-cookie",
-                "captcha_session=school-nonce; Path=/; HttpOnly",
+                "captcha_session=identity-nonce; Path=/; HttpOnly",
             ),
         ],
         png,
@@ -122,7 +130,7 @@ async fn school_identity(
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
-    captcha_session(&headers);
+    captcha_session(&headers, "identity-nonce");
     if form["checkcode"] != "1234" {
         return Html("验证码错误").into_response();
     }
@@ -152,7 +160,7 @@ async fn school_qr(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     if query.get("op").map(String::as_str) == Some("checklogin") {
-        captcha_session(&headers);
+        captcha_session(&headers, "wechat-nonce");
         if !mock.school_scan_ready.load(Ordering::SeqCst) {
             return Json(json!({"status":false})).into_response();
         }
@@ -167,7 +175,7 @@ async fn school_qr(
     (
         [(
             "set-cookie",
-            "captcha_session=school-nonce; Path=/; HttpOnly",
+            "captcha_session=wechat-nonce; Path=/; HttpOnly",
         )],
         Html(r#"<script>var qrurl = "weixin://school/mock-qr";</script>"#),
     )
@@ -406,6 +414,15 @@ async fn school_login_and_course_requests_use_configured_socks_proxy(db: PgPool)
     server.abort();
 }
 
+async fn punch_list(State(mock): State<Arc<Mock>>) -> Html<&'static str> {
+    mock.task_queries.fetch_add(1, Ordering::SeqCst);
+    Html(if mock.no_open_tasks.load(Ordering::SeqCst) {
+        "当前没有签到任务"
+    } else {
+        "<div class='punch-card'><div class='font-weight-bold'>2024级学生每晚考勤</div><a href='/student/punchw/course/12/99?sid=4'>点此去完成签到</a></div>"
+    })
+}
+
 async fn punch_state(State(mock): State<Arc<Mock>>) -> Html<&'static str> {
     if mock.done.load(Ordering::SeqCst) {
         Html("我已签到过啦")
@@ -505,6 +522,12 @@ async fn send(
             .unwrap()
             .contains("Hist-Auto-Checkin")
     );
+    mock.sent_texts.lock().await.push(
+        msg["item_list"][0]["text_item"]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+    );
     mock.sent_client_ids
         .lock()
         .await
@@ -600,7 +623,7 @@ async fn school_account(app: &Router, token: &str) -> Uuid {
 }
 
 fn schedule_input(account: Uuid) -> Value {
-    json!({"school_account_id":account,"course_ids":["12"],"local_time":"08:30","weekdays":[1,2,3,4,5,6,7],"latitude":35.281256,"longitude":113.935975,"location_name":"1号宿舍楼","retry_window_minutes":10})
+    json!({"school_account_id":account,"course_ids":["12"],"local_time":"08:30","weekdays":[1,2,3,4,5,6,7],"latitude":35.281256,"longitude":113.935975,"location_name":"1号宿舍楼"})
 }
 
 async fn schedule(app: &Router, token: &str, account: Uuid) -> Uuid {
@@ -627,6 +650,451 @@ async fn run(app: &Router, token: &str, schedule: Uuid) -> Uuid {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     body["job_id"].as_str().unwrap().parse().unwrap()
+}
+
+async fn daily_schedule(app: &Router, token: &str, account: Uuid) -> Uuid {
+    let (status, body) = request(
+        app,
+        "POST",
+        "/api/schedules",
+        Some(token),
+        json!({"school_account_id":account,"local_time":"08:30","latitude":35.281256,"longitude":113.935975,"location_name":"1号宿舍楼"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body["id"].as_str().unwrap().parse().unwrap()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn user_dashboard_counts_lifetime_success_and_toggle_is_tenant_scoped(db: PgPool) {
+    let (base, server) = mock_server(Arc::new(Mock::default())).await;
+    let state = state(db.clone(), &base);
+    let app = app(state);
+    let (_, alice) = register(&app, "dashboard-alice").await;
+    let (_, bob) = register(&app, "dashboard-bob").await;
+    let alice_account = school_account(&app, &alice).await;
+    let bob_account = school_account(&app, &bob).await;
+    let alice_schedule = daily_schedule(&app, &alice, alice_account).await;
+    let bob_schedule = daily_schedule(&app, &bob, bob_account).await;
+    let alice_job = run(&app, &alice, alice_schedule).await;
+    let bob_job = run(&app, &bob, bob_schedule).await;
+    for (account, job, punch, offset) in [
+        (alice_account, alice_job, "201", -1_i32),
+        (alice_account, alice_job, "202", 1_i32),
+        (bob_account, bob_job, "203", 1_i32),
+    ] {
+        sqlx::query("INSERT INTO checkin_records(school_account_id,course_id,punch_id,punch_url,job_id,status,message,latitude,longitude,updated_at) VALUES($1,'12',$2,'https://school.test/punch',$3,'succeeded','签到成功',35.281256,113.935975,(date_trunc('day',now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai')+$4::integer*interval '1 minute')")
+            .bind(account).bind(punch).bind(job).bind(offset).execute(&db).await.unwrap();
+    }
+    let (status, dashboard) = request(&app, "GET", "/api/dashboard", Some(&alice), json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dashboard["total_successful_checkins"], 2);
+    assert_eq!(dashboard["today_successful_checkins"], 1);
+    assert_eq!(dashboard["today_status"], "success");
+    assert_eq!(dashboard["auto_checkin_enabled"], true);
+
+    let (status, dashboard) = request(
+        &app,
+        "PUT",
+        "/api/auto-checkin",
+        Some(&alice),
+        json!({"enabled":false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dashboard["auto_checkin_enabled"], false);
+    let alice_status: String = sqlx::query_scalar("SELECT status FROM checkin_jobs WHERE id=$1")
+        .bind(alice_job)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    let bob_status: String = sqlx::query_scalar("SELECT status FROM checkin_jobs WHERE id=$1")
+        .bind(bob_job)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(alice_status, "cancelled");
+    assert_eq!(bob_status, "pending");
+    let (_, bob_dashboard) = request(&app, "GET", "/api/dashboard", Some(&bob), json!({})).await;
+    assert_eq!(bob_dashboard["total_successful_checkins"], 1);
+    assert_eq!(bob_dashboard["auto_checkin_enabled"], true);
+
+    let (status, dashboard) = request(
+        &app,
+        "PUT",
+        "/api/auto-checkin",
+        Some(&alice),
+        json!({"enabled":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dashboard["auto_checkin_enabled"], true);
+    let next: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT next_run_at FROM checkin_schedules WHERE id=$1")
+            .bind(alice_schedule)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert!(next > chrono::Utc::now());
+    server.abort();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn disabling_auto_checkin_cancels_recovered_jobs_without_submitting(db: PgPool) {
+    let mock = Arc::new(Mock::default());
+    let (base, server) = mock_server(mock.clone()).await;
+    let state = state(db.clone(), &base);
+    let app = app(state.clone());
+    let (_, token) = register(&app, "paused-worker").await;
+    let account = school_account(&app, &token).await;
+    let schedule = daily_schedule(&app, &token, account).await;
+    let job = run(&app, &token, schedule).await;
+    assert!(workers::claim_job(&state).await.unwrap().is_some());
+    let (status, dashboard) = request(
+        &app,
+        "PUT",
+        "/api/auto-checkin",
+        Some(&token),
+        json!({"enabled":false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dashboard["auto_checkin_enabled"], false);
+    sqlx::query("UPDATE checkin_jobs SET lease_until=now()-interval '1 second' WHERE id=$1")
+        .bind(job)
+        .execute(&db)
+        .await
+        .unwrap();
+    workers::schedule_tick(&state).await.unwrap();
+    let status: String = sqlx::query_scalar("SELECT status FROM checkin_jobs WHERE id=$1")
+        .bind(job)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(status, "cancelled");
+    assert!(workers::claim_job(&state).await.unwrap().is_none());
+    assert_eq!(mock.submissions.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn daily_schedule_discovers_current_task_without_course_or_weekday_input(db: PgPool) {
+    let mock = Arc::new(Mock::default());
+    let (base, server) = mock_server(mock.clone()).await;
+    let state = state(db.clone(), &base);
+    let app = app(state.clone());
+    let (_, token) = register(&app, "daily-user").await;
+    let account = school_account(&app, &token).await;
+    let schedule = daily_schedule(&app, &token, account).await;
+    let (_, list) = request(&app, "GET", "/api/schedules", Some(&token), json!({})).await;
+    assert_eq!(list[0]["course_ids"], json!([]));
+    assert_eq!(list[0]["weekdays"], json!([1, 2, 3, 4, 5, 6, 7]));
+    assert_eq!(list[0]["timezone"], "Asia/Shanghai");
+    assert_eq!(list[0]["enabled"], true);
+    assert!(list[0].get("retry_window_minutes").is_none());
+
+    sqlx::query("UPDATE checkin_schedules SET next_run_at=now()-interval '1 minute' WHERE id=$1")
+        .bind(schedule)
+        .execute(&db)
+        .await
+        .unwrap();
+    workers::schedule_tick(&state).await.unwrap();
+    let first: Uuid = sqlx::query_scalar("SELECT id FROM checkin_jobs WHERE schedule_id=$1")
+        .bind(schedule)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let tasks = workers::start(state, cancel.clone());
+    wait_status(&db, "checkin_jobs", first, "succeeded").await;
+
+    mock.use_second_course.store(true, Ordering::SeqCst);
+    mock.done.store(false, Ordering::SeqCst);
+    let second = run(&app, &token, schedule).await;
+    wait_status(&db, "checkin_jobs", second, "succeeded").await;
+    let records: Vec<String> = sqlx::query_scalar(
+        "SELECT course_id FROM checkin_records WHERE school_account_id=$1 ORDER BY course_id",
+    )
+    .bind(account)
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(records, vec!["12", "15"]);
+    assert_eq!(mock.submissions.load(Ordering::SeqCst), 2);
+    cancel.cancel();
+    for task in tasks {
+        let _ = task.await;
+    }
+    server.abort();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn checkin_retries_wait_sixty_seconds_and_stop_after_two_retries(db: PgPool) {
+    let mock = Arc::new(Mock::default());
+    mock.no_open_tasks.store(true, Ordering::SeqCst);
+    let (base, server) = mock_server(mock.clone()).await;
+    let state = state(db.clone(), &base);
+    let app = app(state.clone());
+    let (_, token) = register(&app, "retry-policy").await;
+    let account = school_account(&app, &token).await;
+    let schedule = daily_schedule(&app, &token, account).await;
+    let cancel = CancellationToken::new();
+    let tasks = workers::start(state.clone(), cancel.clone());
+
+    for opens_on_last_retry in [false, true] {
+        mock.no_open_tasks.store(true, Ordering::SeqCst);
+        mock.task_queries.store(0, Ordering::SeqCst);
+        let job = run(&app, &token, schedule).await;
+        for attempt in 1..=3 {
+            let expected = if attempt < 3 {
+                "pending"
+            } else if opens_on_last_retry {
+                "succeeded"
+            } else {
+                "failed"
+            };
+            tokio::time::timeout(Duration::from_secs(12), async {
+                loop {
+                    let ready: bool = sqlx::query_scalar(
+                        "SELECT status=$2 AND attempts=$3 FROM checkin_jobs WHERE id=$1",
+                    )
+                    .bind(job)
+                    .bind(expected)
+                    .bind(attempt)
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+                    if ready {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let (delay, finished, notifications, message): (f64, bool, i64, String) =
+                sqlx::query_as("SELECT EXTRACT(EPOCH FROM (available_at-now()))::double precision,finished_at IS NOT NULL,(SELECT count(*) FROM notification_outbox WHERE job_id=$1),result_message FROM checkin_jobs WHERE id=$1")
+                    .bind(job).fetch_one(&db).await.unwrap();
+            assert_eq!(mock.task_queries.load(Ordering::SeqCst), attempt as usize);
+            if attempt < 3 {
+                assert!(
+                    (55.0..=60.0).contains(&delay),
+                    "Retry delay was {delay} seconds"
+                );
+                assert!(!finished);
+                assert_eq!(notifications, 0);
+                assert!(workers::claim_job(&state).await.unwrap().is_none());
+                if attempt == 2 && opens_on_last_retry {
+                    mock.no_open_tasks.store(false, Ordering::SeqCst);
+                }
+                // Make the persisted retry due without waiting a real minute.
+                sqlx::query("UPDATE checkin_jobs SET available_at=now() WHERE id=$1")
+                    .bind(job)
+                    .execute(&db)
+                    .await
+                    .unwrap();
+            } else {
+                assert!(finished);
+                assert_eq!(notifications, 1);
+                if !opens_on_last_retry {
+                    assert!(message.contains("最多重试 2 次"));
+                    let body: String =
+                        sqlx::query_scalar("SELECT body FROM notification_outbox WHERE job_id=$1")
+                            .bind(job)
+                            .fetch_one(&db)
+                            .await
+                            .unwrap();
+                    assert_eq!(body, format!("Hist-Auto-Checkin\n自动签到\n{message}"));
+                }
+                workers::schedule_tick(&state).await.unwrap();
+                assert!(workers::claim_job(&state).await.unwrap().is_none());
+            }
+        }
+    }
+    assert_eq!(mock.submissions.load(Ordering::SeqCst), 1);
+    cancel.cancel();
+    for task in tasks {
+        let _ = task.await;
+    }
+    server.abort();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn recovered_checkin_at_retry_limit_is_failed_without_another_execution(db: PgPool) {
+    let (base, server) = mock_server(Arc::new(Mock::default())).await;
+    let state = state(db.clone(), &base);
+    let app = app(state.clone());
+    let (_, token) = register(&app, "retry-recovery").await;
+    let account = school_account(&app, &token).await;
+    let schedule = daily_schedule(&app, &token, account).await;
+    let job = run(&app, &token, schedule).await;
+    sqlx::query("UPDATE checkin_jobs SET attempts=2 WHERE id=$1")
+        .bind(job)
+        .execute(&db)
+        .await
+        .unwrap();
+    let (claimed, _, _) = workers::claim_job(&state).await.unwrap().unwrap();
+    assert_eq!(claimed.attempts, 3);
+    sqlx::query("UPDATE checkin_jobs SET lease_until=now()-interval '1 second' WHERE id=$1")
+        .bind(job)
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE school_accounts SET execution_until=now()-interval '1 second' WHERE id=$1")
+        .bind(account)
+        .execute(&db)
+        .await
+        .unwrap();
+    workers::schedule_tick(&state).await.unwrap();
+    workers::schedule_tick(&state).await.unwrap();
+    let (status, attempts, notifications, message): (String, i32, i64, String) =
+        sqlx::query_as("SELECT status,attempts,(SELECT count(*) FROM notification_outbox WHERE job_id=$1),result_message FROM checkin_jobs WHERE id=$1")
+            .bind(job).fetch_one(&db).await.unwrap();
+    assert_eq!(status, "failed");
+    assert_eq!(attempts, 3);
+    assert_eq!(notifications, 1);
+    assert!(message.contains("最多重试 2 次"));
+    assert!(workers::claim_job(&state).await.unwrap().is_none());
+    server.abort();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn delayed_checkin_can_execute_and_retry_after_long_queue_wait(db: PgPool) {
+    let mock = Arc::new(Mock::default());
+    mock.no_open_tasks.store(true, Ordering::SeqCst);
+    let (base, server) = mock_server(mock.clone()).await;
+    let state = state(db.clone(), &base);
+    let app = app(state.clone());
+    let (_, token) = register(&app, "delayed-retry").await;
+    let account = school_account(&app, &token).await;
+    let schedule = daily_schedule(&app, &token, account).await;
+    sqlx::query("UPDATE checkin_schedules SET next_run_at=now()-interval '1 hour' WHERE id=$1")
+        .bind(schedule)
+        .execute(&db)
+        .await
+        .unwrap();
+    workers::schedule_tick(&state).await.unwrap();
+    let job: Uuid = sqlx::query_scalar("SELECT id FROM checkin_jobs WHERE schedule_id=$1")
+        .bind(schedule)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let tasks = workers::start(state, cancel.clone());
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while mock.task_queries.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    wait_status(&db, "checkin_jobs", job, "pending").await;
+    let (attempts, finished): (i32, bool) =
+        sqlx::query_as("SELECT attempts,finished_at IS NOT NULL FROM checkin_jobs WHERE id=$1")
+            .bind(job)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(attempts, 1);
+    assert!(!finished);
+    assert_eq!(mock.task_queries.load(Ordering::SeqCst), 1);
+    mock.no_open_tasks.store(false, Ordering::SeqCst);
+    sqlx::query("UPDATE checkin_jobs SET available_at=now() WHERE id=$1")
+        .bind(job)
+        .execute(&db)
+        .await
+        .unwrap();
+    wait_status(&db, "checkin_jobs", job, "succeeded").await;
+    let attempts: i32 = sqlx::query_scalar("SELECT attempts FROM checkin_jobs WHERE id=$1")
+        .bind(job)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(attempts, 2);
+    assert_eq!(mock.task_queries.load(Ordering::SeqCst), 2);
+    assert_eq!(mock.submissions.load(Ordering::SeqCst), 1);
+    cancel.cancel();
+    for task in tasks {
+        let _ = task.await;
+    }
+    server.abort();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn automatic_task_discovery_recovers_uncertain_submission_after_course_changes(db: PgPool) {
+    let mock = Arc::new(Mock::default());
+    mock.ambiguous_reply.store(true, Ordering::SeqCst);
+    let (base, server) = mock_server(mock.clone()).await;
+    let state = state(db.clone(), &base);
+    let app = app(state.clone());
+    let (_, token) = register(&app, "daily-recovery").await;
+    let account = school_account(&app, &token).await;
+    let schedule = daily_schedule(&app, &token, account).await;
+    let cancel = CancellationToken::new();
+    let tasks = workers::start(state, cancel.clone());
+    let job = run(&app, &token, schedule).await;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM checkin_records WHERE school_account_id=$1 AND course_id='12'",
+            )
+            .bind(account)
+            .fetch_optional(&db)
+            .await
+            .unwrap();
+            if status.as_deref() == Some("uncertain") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    wait_status(&db, "checkin_jobs", job, "pending").await;
+    mock.use_second_course.store(true, Ordering::SeqCst);
+    sqlx::query("UPDATE checkin_jobs SET available_at=now() WHERE id=$1")
+        .bind(job)
+        .execute(&db)
+        .await
+        .unwrap();
+    wait_status(&db, "checkin_jobs", job, "succeeded").await;
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM checkin_records WHERE school_account_id=$1 AND course_id='12'",
+    )
+    .bind(account)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(status, "succeeded");
+    let title: String = sqlx::query_scalar(
+        "SELECT task_title FROM checkin_records WHERE school_account_id=$1 AND course_id='12'",
+    )
+    .bind(account)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(title, "2024级学生每晚考勤");
+    let body: String = sqlx::query_scalar("SELECT body FROM notification_outbox WHERE job_id=$1")
+        .bind(job)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        body,
+        "Hist-Auto-Checkin\n大学英语签到；2024级学生每晚考勤\n已签到；已签到"
+    );
+    assert!(!body.contains("待确认签到"));
+    assert!(!body.contains(&job.to_string()));
+    assert_eq!(
+        mock.submissions.load(Ordering::SeqCst),
+        1,
+        "An uncertain submission must be confirmed, not repeated"
+    );
+    cancel.cancel();
+    for task in tasks {
+        let _ = task.await;
+    }
+    server.abort();
 }
 
 async fn bind_weixin(app: &Router, token: &str) {
@@ -809,7 +1277,7 @@ async fn queue_claims_serialize_account_and_recover_expired_leases(db: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn scheduled_occurrence_and_deadline_notification_are_atomic(db: PgPool) {
+async fn scheduled_occurrence_creation_is_atomic_after_long_delay(db: PgPool) {
     let (base, server) = mock_server(Arc::new(Mock::default())).await;
     let state = state(db.clone(), &base);
     let app = app(state.clone());
@@ -828,13 +1296,13 @@ async fn scheduled_occurrence_and_deadline_notification_are_atomic(db: PgPool) {
     a.unwrap();
     b.unwrap();
     let counts: (i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM checkin_jobs WHERE schedule_id=$1),(SELECT count(*) FROM notification_outbox)").bind(schedule).fetch_one(&db).await.unwrap();
-    assert_eq!(counts, (1, 1));
+    assert_eq!(counts, (1, 0));
     let status: String = sqlx::query_scalar("SELECT status FROM checkin_jobs WHERE schedule_id=$1")
         .bind(schedule)
         .fetch_one(&db)
         .await
         .unwrap();
-    assert_eq!(status, "failed");
+    assert_eq!(status, "pending");
     server.abort();
 }
 
@@ -890,9 +1358,16 @@ async fn full_checkin_weixin_flow_retries_notification_without_repunch(db: PgPoo
         ids.iter().all(|id| id == &ids[0]),
         "notification retries must retain client_id"
     );
+    let texts = mock.sent_texts.lock().await;
+    assert!(
+        texts
+            .iter()
+            .all(|text| text == "Hist-Auto-Checkin\n2024级学生每晚考勤\n签到成功")
+    );
     let (_, jobs) = request(&app, "GET", "/api/jobs", Some(&token), json!({})).await;
     assert_eq!(jobs["jobs"][0]["notification_status"], "sent");
     assert_eq!(jobs["jobs"][0]["records"][0]["latitude"], 35.281256);
+    assert_eq!(jobs["jobs"][0]["records"][0]["title"], "2024级学生每晚考勤");
     cancel.cancel();
     for task in tasks {
         task.await.unwrap();
@@ -960,6 +1435,15 @@ async fn invalid_school_credentials_pause_rules_and_enqueue_result(db: PgPool) {
     wait_status(&db, "checkin_jobs", job, "failed").await;
     let row: (String,bool,i64)=sqlx::query_as("SELECT a.credential_status,s.enabled,(SELECT count(*) FROM notification_outbox WHERE job_id=$1) FROM school_accounts a JOIN checkin_schedules s ON s.school_account_id=a.id WHERE s.id=$2").bind(job).bind(schedule).fetch_one(&db).await.unwrap();
     assert_eq!(row, ("invalid".into(), false, 1));
+    let body: String = sqlx::query_scalar("SELECT body FROM notification_outbox WHERE job_id=$1")
+        .bind(job)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        body,
+        "Hist-Auto-Checkin\n自动签到\n学校登录已失效，规则已暂停，请重新登录后启用任务"
+    );
     assert_eq!(mock.submissions.load(Ordering::SeqCst), 0);
     cancel.cancel();
     for task in tasks {
@@ -1010,6 +1494,152 @@ fn cookie_from(headers: &HeaderMap, name: &str) -> String {
         .to_string()
 }
 
+#[tokio::test]
+async fn frontend_modules_are_served_with_javascript_mime_and_unknown_paths_are_rejected() {
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+        .unwrap();
+    let app = app(state(db, "https://school.example"));
+    for path in [
+        "site.js",
+        "theme.js",
+        "qrcode.js",
+        "common/api.js",
+        "common/dom.js",
+        "common/polling.js",
+        "components/celebration.js",
+        "components/qr-code.js",
+        "components/select.js",
+        "pages/login.js",
+        "pages/tasks.js",
+        "pages/notifications.js",
+        "pages/account.js",
+    ] {
+        let (status, headers, _) = web_request(
+            &app,
+            "GET",
+            &format!("/assets/{path}"),
+            None,
+            json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(headers["content-type"], "text/javascript; charset=utf-8");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+    }
+    for path in [
+        "/assets/pages/missing.js",
+        "/assets/../Cargo.toml",
+        "/assets/%2e%2e/%2e%2e/.env",
+        "/assets/vendor/qrcode.js",
+    ] {
+        let (status, _, _) = web_request(&app, "GET", path, None, json!({}), false).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn web_entry_redirects_before_rendering_login_and_respects_session_state(db: PgPool) {
+    let (base, server) = mock_server(Arc::new(Mock::default())).await;
+    let app = app(state(db.clone(), &base));
+    for cookie in [None, Some("hist_session=invalid")] {
+        let (status, headers, _) =
+            web_request(&app, "GET", "/start", cookie, json!({}), false).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers["location"], "/login");
+        assert_eq!(headers["cache-control"], "no-store");
+        let (status, headers, _) =
+            web_request(&app, "GET", "/login", cookie, json!({}), false).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["cache-control"], "no-store");
+    }
+
+    let (user, token) = register(&app, "entry-alice").await;
+    let cookie = format!("hist_session={token}");
+    let (_, other_token) = register(&app, "entry-bob").await;
+    let other_cookie = format!("hist_session={other_token}");
+    for path in ["/start", "/login"] {
+        let (status, headers, _) =
+            web_request(&app, "GET", path, Some(&cookie), json!({}), false).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers["location"], "/tasks");
+        assert_eq!(headers["cache-control"], "no-store");
+    }
+
+    let account = school_account(&app, &token).await;
+    let schedule_id = schedule(&app, &token, account).await;
+    sqlx::query("UPDATE checkin_schedules SET enabled=false WHERE id=$1")
+        .bind(schedule_id)
+        .execute(&db)
+        .await
+        .unwrap();
+    for path in ["/start", "/login"] {
+        let (status, headers, _) =
+            web_request(&app, "GET", path, Some(&cookie), json!({}), false).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers["location"], "/account");
+        assert_eq!(headers["cache-control"], "no-store");
+        let (status, headers, _) =
+            web_request(&app, "GET", path, Some(&other_cookie), json!({}), false).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers["location"], "/tasks");
+    }
+
+    let (status, headers, _) = web_request(
+        &app,
+        "GET",
+        "/login?reconnect=1",
+        Some(&cookie),
+        json!({}),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("location"));
+    sqlx::query("UPDATE sessions SET expires_at=now()-interval '1 second' WHERE user_id=$1")
+        .bind(user)
+        .execute(&db)
+        .await
+        .unwrap();
+    let (status, headers, _) =
+        web_request(&app, "GET", "/start", Some(&cookie), json!({}), false).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers["location"], "/login");
+    let (status, _, _) = web_request(&app, "GET", "/login", Some(&cookie), json!({}), false).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, _) = web_request(
+        &app,
+        "POST",
+        "/api/auth/logout",
+        Some(&other_cookie),
+        json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, headers, _) =
+        web_request(&app, "GET", "/start", Some(&other_cookie), json!({}), false).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers["location"], "/login");
+    server.abort();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn web_entry_does_not_treat_session_lookup_failures_as_logged_out(db: PgPool) {
+    let app = app(state(db.clone(), "https://school.example"));
+    let (_, token) = register(&app, "entry-database-error").await;
+    let cookie = format!("hist_session={token}");
+    db.close().await;
+    for path in ["/start", "/login"] {
+        let (status, headers, _) =
+            web_request(&app, "GET", path, Some(&cookie), json!({}), false).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!headers.contains_key("location"));
+    }
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn web_identity_login_saves_credentials_without_service_password(db: PgPool) {
     let (base, server) = mock_server(Arc::new(Mock::default())).await;
@@ -1031,7 +1661,7 @@ async fn web_identity_login_saves_credentials_without_service_password(db: PgPoo
             .unwrap()
             .starts_with("data:image/png;base64,")
     );
-    let guest = cookie_from(&headers, "hist_school_login");
+    let guest = cookie_from(&headers, "hist_school_identity_login");
     let (status, _, _) = web_request(
         &app,
         "POST",
@@ -1218,6 +1848,275 @@ async fn web_school_qr_relogin_keeps_tasks_and_isolates_different_identities(db:
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn school_login_methods_keep_separate_cookies_and_refresh_independently(db: PgPool) {
+    let (base, server) = mock_server(Arc::new(Mock::default())).await;
+    let app = app(state(db.clone(), &base));
+    let started_at = chrono::Utc::now();
+    let (_, headers, qr) = web_request(
+        &app,
+        "POST",
+        "/api/school-login/start",
+        None,
+        json!({"method":"wechat"}),
+        true,
+    )
+    .await;
+    let qr_expires: chrono::DateTime<chrono::Utc> =
+        qr["expires_at"].as_str().unwrap().parse().unwrap();
+    assert!(qr_expires >= started_at + chrono::Duration::seconds(300));
+    assert!(qr_expires <= chrono::Utc::now() + chrono::Duration::seconds(300));
+    assert!(
+        headers
+            .get_all("set-cookie")
+            .iter()
+            .any(|h| h.to_str().unwrap().contains("Max-Age=300"))
+    );
+    let previous_wechat = cookie_from(&headers, "hist_school_login");
+    let started_at = chrono::Utc::now();
+    let (status, headers, initial) = web_request(
+        &app,
+        "POST",
+        "/api/school-login/start",
+        Some(&previous_wechat),
+        json!({"method":"identity"}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let identity_expires: chrono::DateTime<chrono::Utc> =
+        initial["expires_at"].as_str().unwrap().parse().unwrap();
+    assert!(identity_expires >= started_at + chrono::Duration::seconds(300));
+    assert!(identity_expires <= chrono::Utc::now() + chrono::Duration::seconds(300));
+    assert!(
+        headers
+            .get_all("set-cookie")
+            .iter()
+            .any(|h| h.to_str().unwrap().contains("Max-Age=300"))
+    );
+    assert!(initial["reusable_until"].as_str().unwrap() < initial["expires_at"].as_str().unwrap());
+    assert!(
+        !headers
+            .get_all("set-cookie")
+            .iter()
+            .any(|h| h.to_str().unwrap().starts_with("hist_school_login="))
+    );
+    let identity = cookie_from(&headers, "hist_school_identity_login");
+    let cookies = format!("{previous_wechat}; {identity}");
+    let (status, _, body) = web_request(
+        &app,
+        "POST",
+        "/api/school-login/poll",
+        Some(&cookies),
+        json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "waiting");
+    let (status, headers, body) = web_request(
+        &app,
+        "POST",
+        "/api/school-login/captcha",
+        Some(&cookies),
+        json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["expires_at"], initial["expires_at"]);
+    assert!(!headers.contains_key("set-cookie"));
+    let (status, headers, _) = web_request(
+        &app,
+        "POST",
+        "/api/school-login/start",
+        Some(&cookies),
+        json!({"method":"wechat"}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let wechat = cookie_from(&headers, "hist_school_login");
+    assert_ne!(wechat, previous_wechat);
+    assert!(!headers.get_all("set-cookie").iter().any(|h| {
+        h.to_str()
+            .unwrap()
+            .starts_with("hist_school_identity_login=")
+    }));
+    let (status, _, _) = web_request(
+        &app,
+        "POST",
+        "/api/school-login/poll",
+        Some(&previous_wechat),
+        json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let cookies = format!("{wechat}; {identity}");
+    let (status, _, body) = web_request(
+        &app,
+        "POST",
+        "/api/school-login/poll",
+        Some(&cookies),
+        json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, headers, body) = web_request(
+        &app,
+        "POST",
+        "/api/school-login/identity",
+        Some(&cookies),
+        json!({"name":"张三","student_no":"2026001","captcha_code":"1234"}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "authenticated");
+    for cookie in ["hist_school_login", "hist_school_identity_login"] {
+        assert!(cookie_from(&headers, cookie).ends_with('='));
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM school_login_sessions")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    server.abort();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn school_login_busy_is_distinct_from_expiry_and_rate_limit_releases_lease(db: PgPool) {
+    let (base, server) = mock_server(Arc::new(Mock::default())).await;
+    let app = app(state(db.clone(), &base));
+    let (_, headers, _) = web_request(
+        &app,
+        "POST",
+        "/api/school-login/start",
+        None,
+        json!({"method":"identity"}),
+        true,
+    )
+    .await;
+    let cookie = cookie_from(&headers, "hist_school_identity_login");
+    sqlx::query(
+        "UPDATE school_login_sessions SET lease_token=$1,lease_until=now()+interval '60 seconds'",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&db)
+    .await
+    .unwrap();
+    let (status, _, body) = web_request(
+        &app,
+        "POST",
+        "/api/school-login/captcha",
+        Some(&cookie),
+        json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "login_session_busy");
+    sqlx::query("UPDATE school_login_sessions SET lease_token=NULL,lease_until=NULL")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO auth_buckets(bucket_key,hits,expires_at) SELECT 'captcha:'||id,20,now()+interval '10 minutes' FROM school_login_sessions").execute(&db).await.unwrap();
+    let (status, _, _) = web_request(
+        &app,
+        "POST",
+        "/api/school-login/captcha",
+        Some(&cookie),
+        json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let released: bool = sqlx::query_scalar(
+        "SELECT lease_token IS NULL AND lease_until IS NULL FROM school_login_sessions",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert!(released);
+    sqlx::query("UPDATE school_login_sessions SET expires_at=now()-interval '1 second'")
+        .execute(&db)
+        .await
+        .unwrap();
+    let (status, _, _) = web_request(
+        &app,
+        "POST",
+        "/api/school-login/captcha",
+        Some(&cookie),
+        json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    server.abort();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn school_login_only_one_method_can_complete(db: PgPool) {
+    let mock = Arc::new(Mock::default());
+    mock.school_scan_ready.store(true, Ordering::SeqCst);
+    let (base, server) = mock_server(mock).await;
+    let app = app(state(db.clone(), &base));
+    let (_, headers, _) = web_request(
+        &app,
+        "POST",
+        "/api/school-login/start",
+        None,
+        json!({"method":"wechat"}),
+        true,
+    )
+    .await;
+    let wechat = cookie_from(&headers, "hist_school_login");
+    let (_, headers, _) = web_request(
+        &app,
+        "POST",
+        "/api/school-login/start",
+        Some(&wechat),
+        json!({"method":"identity"}),
+        true,
+    )
+    .await;
+    let identity = cookie_from(&headers, "hist_school_identity_login");
+    let cookies = format!("{wechat}; {identity}");
+    let (qr_result, identity_result) = tokio::join!(
+        web_request(
+            &app,
+            "POST",
+            "/api/school-login/poll",
+            Some(&cookies),
+            json!({}),
+            true
+        ),
+        web_request(
+            &app,
+            "POST",
+            "/api/school-login/identity",
+            Some(&cookies),
+            json!({"name":"张三","student_no":"2026001","captcha_code":"1234"}),
+            true
+        ),
+    );
+    assert!(
+        matches!(
+            (qr_result.0, identity_result.0),
+            (StatusCode::OK, StatusCode::UNAUTHORIZED) | (StatusCode::UNAUTHORIZED, StatusCode::OK)
+        ),
+        "QR: {qr_result:?}; identity: {identity_result:?}"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    server.abort();
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn school_identity_requires_wechat_and_login_capability_cannot_be_forged(db: PgPool) {
     let mock = Arc::new(Mock::default());
     mock.school_requires_wechat.store(true, Ordering::SeqCst);
@@ -1238,22 +2137,58 @@ async fn school_identity_requires_wechat_and_login_capability_cannot_be_forged(d
         "POST",
         "/api/school-login/start",
         None,
+        json!({"method":"wechat"}),
+        true,
+    )
+    .await;
+    let previous_wechat = cookie_from(&headers, "hist_school_login");
+    let (_, headers, initial) = web_request(
+        &app,
+        "POST",
+        "/api/school-login/start",
+        None,
         json!({"method":"identity"}),
         true,
     )
     .await;
-    let guest = cookie_from(&headers, "hist_school_login");
-    let (status, _, body) = web_request(
+    let identity = cookie_from(&headers, "hist_school_identity_login");
+    let cookies = format!("{previous_wechat}; {identity}");
+    let (status, headers, body) = web_request(
         &app,
         "POST",
         "/api/school-login/identity",
-        Some(&guest),
+        Some(&cookies),
         json!({"name":"张三","student_no":"2026001","captcha_code":"1234"}),
         true,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "need_wechat");
+    assert_eq!(body["expires_at"], initial["expires_at"]);
+    let qr_expires: chrono::DateTime<chrono::Utc> =
+        body["expires_at"].as_str().unwrap().parse().unwrap();
+    let stored_expires: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT expires_at FROM school_login_sessions")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(stored_expires, qr_expires);
+    let guest = cookie_from(&headers, "hist_school_login");
+    assert_eq!(
+        guest.split_once('=').unwrap().1,
+        identity.split_once('=').unwrap().1
+    );
+    assert!(cookie_from(&headers, "hist_school_identity_login").ends_with('='));
+    let (status, _, _) = web_request(
+        &app,
+        "POST",
+        "/api/school-login/poll",
+        Some(&previous_wechat),
+        json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
     let forged = format!("{}.forged", guest.split('.').next().unwrap());
     let (status, _, _) = web_request(
         &app,
@@ -1264,7 +2199,7 @@ async fn school_identity_requires_wechat_and_login_capability_cannot_be_forged(d
         true,
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _, body) = web_request(
         &app,
         "POST",

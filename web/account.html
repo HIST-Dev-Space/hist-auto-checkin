@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="theme-color" content="#fbfdff" />
+    <title>我的账号</title>
+    <script src="/assets/theme.js"></script>
+    <link rel="icon" type="image/png" sizes="512x512" href="/assets/app-icon.png" />
+    <link rel="icon" type="image/svg+xml" sizes="any" href="/assets/app-icon.svg" />
+    <link rel="stylesheet" href="/assets/site.css" />
+    <script type="module" src="/assets/site.js"></script>
+  </head>
+  <body data-page="account">
+    <a class="skip-link" href="#main">跳到我的签到</a>{{site-header}}
+    <main id="main" class="container account-layout">
+      <div class="account-heading">
+        <h1>我的签到</h1>
+        <button
+          id="logout"
+          class="icon-action"
+          type="button"
+          aria-label="退出登录"
+          title="退出登录"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="24"
+            height="24"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class="lucide lucide-log-out preview-icon"
+            aria-hidden="true"
+          >
+            <path d="m16 17 5-5-5-5" />
+            <path d="M21 12H9" />
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+          </svg>
+        </button>
+      </div>
+      <div id="page-error" class="inline-message error" role="alert" hidden></div>
+      <div class="account-stats">
+        <section class="panel stat-card" aria-labelledby="total-title">
+          <h2 id="total-title">累计成功签到</h2>
+          <p class="stat-value">
+            <span id="total-checkins">—</span><span class="stat-unit">次</span>
+          </p>
+        </section>
+        <section class="panel stat-card today-card" aria-labelledby="today-title">
+          <h2 id="today-title">今日签到</h2>
+          <p id="today-status" class="today-status" role="status" aria-live="polite">正在加载</p>
+        </section>
+      </div>
+      <section class="panel automation-card" aria-labelledby="automation-title">
+        <h2 id="automation-title">自动签到</h2>
+        <button
+          id="auto-checkin-toggle"
+          class="control-switch"
+          type="button"
+          role="switch"
+          aria-checked="false"
+          aria-label="自动签到"
+          disabled
+        >
+          <span class="control-switch-thumb" aria-hidden="true"></span>
+        </button>
+      </section>
+      <section
+        id="current-schedule"
+        class="panel current-schedule"
+        aria-labelledby="schedule-title"
+        hidden
+      >
+        <div class="schedule-header">
+          <h2 id="schedule-title">签到设置</h2>
+          <a
+            id="edit-schedule"
+            class="icon-action"
+            href="/tasks"
+            aria-label="修改签到设置"
+            title="修改签到设置"
+            ><svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              class="lucide lucide-square-pen preview-icon"
+              aria-hidden="true"
+            >
+              <path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+              <path
+                d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"
+              /></svg
+          ></a>
+        </div>
+        <dl class="schedule-summary">
+          <div>
+            <dt>签到时间</dt>
+            <dd id="schedule-time"></dd>
+          </div>
+          <div>
+            <dt>签到地点</dt>
+            <dd id="schedule-location"></dd>
+          </div>
+        </dl>
+      </section>
+      <a
+        id="notification-settings"
+        class="panel notification-card"
+        href="/notifications?manage=1"
+        aria-label="管理微信通知"
+      >
+        <span class="notification-icon" aria-hidden="true"
+          ><svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="22"
+            height="22"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" />
+            <path d="M10 21h4" /></svg
+        ></span>
+        <div class="notification-copy">
+          <h2>微信通知</h2>
+          <p id="notification-status" role="status" aria-live="polite">正在加载</p>
+        </div>
+        <svg
+          class="notification-arrow"
+          xmlns="http://www.w3.org/2000/svg"
+          width="20"
+          height="20"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.8"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="m9 5 7 7-7 7" />
+        </svg>
+      </a>
+      <div id="account-recovery" class="account-links" hidden>
+        <a id="configure-task" class="button primary" href="/tasks" hidden>设置自动签到</a
+        ><a id="reconnect-account" class="button secondary" href="/login?reconnect=1" hidden
+          >重新登录</a
+        >
+      </div>
+    </main>
+    {{site-footer}}
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>

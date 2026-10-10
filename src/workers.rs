@@ -5,7 +5,7 @@ use crate::{
     school::{CookieInput, PunchState, PunchTask, SchoolClient, SchoolError},
     weixin::WeixinError,
 };
-use chrono::{DateTime, Duration, Utc};
+use chrono::{Duration, Utc};
 use serde_json::Value;
 use sqlx::{FromRow, types::Json};
 use std::{sync::Arc, time::Duration as StdDuration};
@@ -16,13 +16,18 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+const CHECKIN_RETRY_DELAY_SECONDS: i64 = 60;
+const CHECKIN_ATTEMPT_TIMEOUT: StdDuration = StdDuration::from_secs(180);
+// The initial execution plus at most two retries.
+const MAX_CHECKIN_ATTEMPTS: i32 = 3;
+
 #[derive(Clone, FromRow)]
 pub struct Job {
     pub id: Uuid,
     pub schedule_id: Uuid,
     pub user_id: Uuid,
     pub school_account_id: Uuid,
-    pub deadline_at: DateTime<Utc>,
+    pub attempts: i32,
     pub lease_token: Option<Uuid>,
 }
 
@@ -56,8 +61,8 @@ pub async fn schedule_tick(state: &AppState) -> anyhow::Result<()> {
             &schedule.weekdays,
             Utc::now(),
         )?;
-        sqlx::query("INSERT INTO checkin_jobs(id,schedule_id,user_id,school_account_id,scheduled_at,deadline_at,available_at) VALUES($1,$2,$3,$4,$5,$6,now()) ON CONFLICT(schedule_id,scheduled_at) DO NOTHING")
-            .bind(Uuid::new_v4()).bind(schedule.id).bind(schedule.user_id).bind(schedule.school_account_id).bind(schedule.next_run_at).bind(schedule.next_run_at+Duration::minutes(i64::from(schedule.retry_window_minutes))).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO checkin_jobs(id,schedule_id,user_id,school_account_id,scheduled_at,available_at) VALUES($1,$2,$3,$4,$5,now()) ON CONFLICT(schedule_id,scheduled_at) DO NOTHING")
+            .bind(Uuid::new_v4()).bind(schedule.id).bind(schedule.user_id).bind(schedule.school_account_id).bind(schedule.next_run_at).execute(&mut *tx).await?;
         sqlx::query("UPDATE checkin_schedules SET next_run_at=$1 WHERE id=$2")
             .bind(next)
             .bind(schedule.id)
@@ -65,10 +70,18 @@ pub async fn schedule_tick(state: &AppState) -> anyhow::Result<()> {
             .await?;
     }
     sqlx::query("UPDATE checkin_jobs SET status='pending',lease_token=NULL,lease_until=NULL WHERE status='running' AND lease_until<=now()").execute(&mut *tx).await?;
+    sqlx::query("UPDATE checkin_jobs j SET status='cancelled',finished_at=now(),result_message='自动签到已关闭' FROM checkin_schedules s WHERE j.schedule_id=s.id AND NOT s.enabled AND j.status='pending'").execute(&mut *tx).await?;
     sqlx::query("UPDATE school_accounts SET execution_token=NULL,execution_until=NULL WHERE execution_until<=now()").execute(&mut *tx).await?;
-    let expired: Vec<(Uuid,Uuid)> = sqlx::query_as("UPDATE checkin_jobs SET status='failed',result_message='签到窗口已结束，未能完成签到',finished_at=now() WHERE status='pending' AND deadline_at<=now() RETURNING id,user_id").fetch_all(&mut *tx).await?;
-    for (job, user) in expired {
-        enqueue(&mut tx, user, job, "签到窗口已结束，未能完成签到").await?;
+    let exhausted: Vec<(Uuid, Uuid)> = sqlx::query_as("UPDATE checkin_jobs SET status='failed',result_message='已达到重试上限（最多重试 2 次），未能完成签到',finished_at=now() WHERE status='pending' AND attempts>=$1 RETURNING id,user_id")
+        .bind(MAX_CHECKIN_ATTEMPTS).fetch_all(&mut *tx).await?;
+    for (job, user) in exhausted {
+        enqueue(
+            &mut tx,
+            user,
+            job,
+            "已达到重试上限（最多重试 2 次），未能完成签到",
+        )
+        .await?;
     }
     sqlx::query("UPDATE notification_outbox SET status='pending',lease_token=NULL,lease_until=NULL WHERE status='sending' AND lease_until<=now()").execute(&mut *tx).await?;
     sqlx::query("UPDATE notification_outbox SET status='failed',last_error=COALESCE(last_error,'通知已过期') WHERE status='pending' AND expires_at<=now()").execute(&mut *tx).await?;
@@ -94,19 +107,25 @@ async fn enqueue(
     job: Uuid,
     message: &str,
 ) -> anyhow::Result<()> {
-    let body = format!("Hist-Auto-Checkin\n任务：{job}\n结果：{message}");
+    let title: String = sqlx::query_scalar(
+        "SELECT COALESCE(NULLIF(task_title,''),'自动签到') FROM checkin_jobs WHERE id=$1",
+    )
+    .bind(job)
+    .fetch_one(&mut **tx)
+    .await?;
+    let body = format!("Hist-Auto-Checkin\n{title}\n{message}");
     sqlx::query("INSERT INTO notification_outbox(id,user_id,job_id,body) VALUES($1,$2,$3,$4) ON CONFLICT(job_id) DO NOTHING").bind(Uuid::new_v4()).bind(user).bind(job).bind(body).execute(&mut **tx).await?;
     Ok(())
 }
 
 pub async fn claim_job(state: &AppState) -> anyhow::Result<Option<(Job, ScheduleRow, String)>> {
     let mut tx = state.db.begin().await?;
-    let job: Option<Job> = sqlx::query_as("SELECT j.* FROM checkin_jobs j JOIN school_accounts a ON a.id=j.school_account_id JOIN checkin_schedules s ON s.id=j.schedule_id WHERE j.status='pending' AND j.available_at<=now() AND j.deadline_at>now() AND s.enabled AND a.credential_status='active' AND (a.execution_until IS NULL OR a.execution_until<=now()) ORDER BY j.available_at FOR UPDATE OF j,a,s SKIP LOCKED LIMIT 1").fetch_optional(&mut *tx).await?;
+    let job: Option<Job> = sqlx::query_as("SELECT j.* FROM checkin_jobs j JOIN school_accounts a ON a.id=j.school_account_id JOIN checkin_schedules s ON s.id=j.schedule_id WHERE j.status='pending' AND j.attempts<$1 AND j.available_at<=now() AND s.enabled AND a.credential_status='active' AND (a.execution_until IS NULL OR a.execution_until<=now()) ORDER BY j.available_at FOR UPDATE OF j,a,s SKIP LOCKED LIMIT 1").bind(MAX_CHECKIN_ATTEMPTS).fetch_optional(&mut *tx).await?;
     let Some(mut job) = job else {
         return Ok(None);
     };
     let token = Uuid::new_v4();
-    sqlx::query("UPDATE checkin_jobs SET status='running',attempts=attempts+1,lease_token=$1,lease_until=now()+interval '120 seconds' WHERE id=$2").bind(token).bind(job.id).execute(&mut *tx).await?;
+    job.attempts = sqlx::query_scalar("UPDATE checkin_jobs SET status='running',attempts=attempts+1,lease_token=$1,lease_until=now()+interval '120 seconds' WHERE id=$2 RETURNING attempts").bind(token).bind(job.id).fetch_one(&mut *tx).await?;
     let cookies: String = sqlx::query_scalar("UPDATE school_accounts SET execution_token=$1,execution_until=now()+interval '120 seconds' WHERE id=$2 RETURNING cookies_ciphertext").bind(token).bind(job.school_account_id).fetch_one(&mut *tx).await?;
     let schedule = sqlx::query_as("SELECT * FROM checkin_schedules WHERE id=$1")
         .bind(job.schedule_id)
@@ -160,13 +179,12 @@ async fn run_job(state: AppState, (job, schedule, ciphertext): (Job, ScheduleRow
         stop.clone(),
         lost.clone(),
     ));
-    let remaining = (job.deadline_at - Utc::now()).to_std().unwrap_or_default();
     let outcome = tokio::select! {
         _=lost.cancelled()=>None,
-        result=tokio::time::timeout(remaining,process_job(&state,&job,&schedule,&ciphertext))=>Some(match result {
+        result=tokio::time::timeout(CHECKIN_ATTEMPT_TIMEOUT,process_job(&state,&job,&schedule,&ciphertext))=>Some(match result {
             Ok(Ok(outcome))=>outcome,
             Ok(Err(error))=>{ tracing::error!(job_id=%job.id,%error,"job processing failed"); Outcome::Retry("执行服务暂时不可用".into()) },
-            Err(_)=>Outcome::Done(false,"签到窗口已结束；如请求曾超时，请在学校系统确认结果".into()),
+            Err(_)=>Outcome::Retry("本次签到执行超时".into()),
         })
     };
     stop.cancel();
@@ -235,8 +253,8 @@ async fn process_with_client(
         Err(error) => return Ok(Outcome::Retry(error.to_string())),
     };
     // Recover intents even when the school no longer lists a task as active.
-    let uncertain: Vec<(String,String,String)> = sqlx::query_as("SELECT course_id,punch_id,punch_url FROM checkin_records WHERE school_account_id=$1 AND course_id=ANY($2) AND status IN ('submitting','uncertain')").bind(job.school_account_id).bind(&schedule.course_ids).fetch_all(&state.db).await?;
-    for (course_id, punch_id, url) in uncertain {
+    let uncertain: Vec<(String,String,String,String)> = sqlx::query_as("SELECT course_id,punch_id,punch_url,task_title FROM checkin_records WHERE school_account_id=$1 AND ($3 OR course_id=ANY($2)) AND status IN ('submitting','uncertain')").bind(job.school_account_id).bind(&schedule.course_ids).bind(schedule.course_ids.is_empty()).fetch_all(&state.db).await?;
+    for (course_id, punch_id, url, title) in uncertain {
         if !tasks
             .iter()
             .any(|t| t.course_id == course_id && t.punch_id == punch_id)
@@ -249,21 +267,32 @@ async fn process_with_client(
             tasks.push(PunchTask {
                 course_id,
                 punch_id,
-                title: "待确认签到".into(),
+                title: if title.trim().is_empty() {
+                    "签到任务".into()
+                } else {
+                    title
+                },
                 url,
             });
         }
     }
     if tasks.is_empty() {
-        return Ok(Outcome::Retry("指定课程尚未开放签到".into()));
+        return Ok(Outcome::Retry("当前尚未开放签到".into()));
     }
+    let title = tasks
+        .iter()
+        .map(|task| task.title.as_str())
+        .collect::<Vec<_>>()
+        .join("；");
+    sqlx::query("UPDATE checkin_jobs SET task_title=$1 WHERE id=$2 AND lease_token=$3 AND status='running' AND lease_until>now()")
+        .bind(title).bind(job.id).bind(job.lease_token).execute(&state.db).await?;
     let mut messages = Vec::new();
     let mut failures = false;
     let mut pending = false;
     for task in tasks {
         let prior: Option<String>=sqlx::query_scalar("SELECT status FROM checkin_records WHERE school_account_id=$1 AND course_id=$2 AND punch_id=$3").bind(job.school_account_id).bind(&task.course_id).bind(&task.punch_id).fetch_optional(&state.db).await?;
         if prior.as_deref() == Some("succeeded") {
-            messages.push(format!("课程 {} 已签到", task.course_id));
+            messages.push("已签到".to_owned());
             continue;
         }
         let current = match client.state(&task).await {
@@ -283,7 +312,7 @@ async fn process_with_client(
             }
             PunchState::Ready if matches!(prior.as_deref(), Some("submitting" | "uncertain")) => {
                 pending = true;
-                messages.push(format!("课程 {} 的提交结果待确认", task.course_id));
+                messages.push("提交结果待确认".into());
                 continue;
             }
             PunchState::Ready => {
@@ -307,7 +336,7 @@ async fn process_with_client(
             }
         };
         save_record(state, job, schedule, &task, status, &message).await?;
-        messages.push(format!("课程 {}：{}", task.course_id, message));
+        messages.push(message);
     }
     let message = messages.join("；");
     if pending {
@@ -318,7 +347,7 @@ async fn process_with_client(
 }
 
 async fn ensure_owned(state: &AppState, job: &Job) -> anyhow::Result<()> {
-    let owned: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM checkin_jobs WHERE id=$1 AND lease_token=$2 AND status='running' AND lease_until>now() AND deadline_at>now())").bind(job.id).bind(job.lease_token).fetch_one(&state.db).await?;
+    let owned: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM checkin_jobs WHERE id=$1 AND lease_token=$2 AND status='running' AND lease_until>now())").bind(job.id).bind(job.lease_token).fetch_one(&state.db).await?;
     anyhow::ensure!(owned, "execution lease lost");
     Ok(())
 }
@@ -334,8 +363,8 @@ async fn save_record(
     let mut tx = state.db.begin().await?;
     let owned: Option<Uuid>=sqlx::query_scalar("SELECT id FROM checkin_jobs WHERE id=$1 AND lease_token=$2 AND status='running' AND lease_until>now() FOR UPDATE").bind(job.id).bind(job.lease_token).fetch_optional(&mut *tx).await?;
     anyhow::ensure!(owned.is_some(), "execution lease lost");
-    sqlx::query("INSERT INTO checkin_records(school_account_id,course_id,punch_id,punch_url,job_id,status,message,latitude,longitude) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(school_account_id,course_id,punch_id) DO UPDATE SET job_id=EXCLUDED.job_id,status=EXCLUDED.status,message=EXCLUDED.message,latitude=EXCLUDED.latitude,longitude=EXCLUDED.longitude,updated_at=now() WHERE checkin_records.status<>'succeeded'")
-        .bind(job.school_account_id).bind(&task.course_id).bind(&task.punch_id).bind(task.url.as_str()).bind(job.id).bind(status).bind(message).bind(schedule.latitude).bind(schedule.longitude).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO checkin_records(school_account_id,course_id,punch_id,punch_url,task_title,job_id,status,message,latitude,longitude) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(school_account_id,course_id,punch_id) DO UPDATE SET task_title=EXCLUDED.task_title,job_id=EXCLUDED.job_id,status=EXCLUDED.status,message=EXCLUDED.message,latitude=EXCLUDED.latitude,longitude=EXCLUDED.longitude,updated_at=now() WHERE checkin_records.status<>'succeeded'")
+        .bind(job.school_account_id).bind(&task.course_id).bind(&task.punch_id).bind(task.url.as_str()).bind(&task.title).bind(job.id).bind(status).bind(message).bind(schedule.latitude).bind(schedule.longitude).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -346,14 +375,17 @@ async fn finish_job(state: &AppState, job: &Job, outcome: Outcome) -> anyhow::Re
     if owned.is_none() {
         return Ok(());
     }
+    let retry_at = Utc::now() + Duration::seconds(CHECKIN_RETRY_DELAY_SECONDS);
     let (status, message, terminal) = match outcome {
         Outcome::Done(success, message) => {
             (if success { "succeeded" } else { "failed" }, message, true)
         }
-        Outcome::Retry(message) if job.deadline_at > Utc::now() + Duration::seconds(30) => {
-            ("pending", message, false)
-        }
-        Outcome::Retry(message) => ("failed", format!("签到窗口结束：{message}"), true),
+        Outcome::Retry(message) if job.attempts >= MAX_CHECKIN_ATTEMPTS => (
+            "failed",
+            format!("已达到重试上限（最多重试 2 次）：{message}"),
+            true,
+        ),
+        Outcome::Retry(message) => ("pending", message, false),
         Outcome::Invalid => {
             sqlx::query("UPDATE school_accounts SET credential_status='invalid' WHERE id=$1")
                 .bind(job.school_account_id)
@@ -371,7 +403,7 @@ async fn finish_job(state: &AppState, job: &Job, outcome: Outcome) -> anyhow::Re
             )
         }
     };
-    sqlx::query("UPDATE checkin_jobs SET status=$1,result_message=$2,available_at=now()+interval '30 seconds',lease_token=NULL,lease_until=NULL,finished_at=CASE WHEN $3 THEN now() ELSE NULL END WHERE id=$4").bind(status).bind(&message).bind(terminal).bind(job.id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE checkin_jobs SET status=$1,result_message=$2,available_at=$4,lease_token=NULL,lease_until=NULL,finished_at=CASE WHEN $3 THEN now() ELSE NULL END WHERE id=$5").bind(status).bind(&message).bind(terminal).bind(retry_at).bind(job.id).execute(&mut *tx).await?;
     sqlx::query("UPDATE school_accounts SET execution_token=NULL,execution_until=NULL WHERE id=$1 AND execution_token=$2").bind(job.school_account_id).bind(job.lease_token).execute(&mut *tx).await?;
     if terminal {
         enqueue(&mut tx, job.user_id, job.id, &message).await?;

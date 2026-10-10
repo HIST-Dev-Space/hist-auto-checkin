@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="theme-color" content="#fbfdff" />
+    <title>微信通知</title>
+    <script src="/assets/theme.js"></script>
+    <link rel="icon" type="image/png" sizes="512x512" href="/assets/app-icon.png" />
+    <link rel="icon" type="image/svg+xml" sizes="any" href="/assets/app-icon.svg" />
+    <link rel="stylesheet" href="/assets/site.css" />
+    <script type="module" src="/assets/site.js"></script>
+  </head>
+  <body data-page="notifications">
+    <a class="skip-link" href="#main">跳到微信通知设置</a>{{site-header}}
+    <main id="main" class="container setup-layout">
+      <section class="panel setup-panel notification-setup" aria-labelledby="setup-title">
+        <h1 id="setup-title">微信通知</h1>
+        <div id="page-error" class="inline-message error" role="alert" hidden></div>
+        <div id="notify-login" hidden><div id="notify-qr" class="qr-box"></div></div>
+        <p id="notify-qr-status" class="notification-status" role="status" aria-live="polite">
+          正在检查
+        </p>
+        <div id="notify-verify" hidden>
+          <label class="field" for="notify-verify-code">微信验证码</label>
+          <div class="verify-row">
+            <input
+              id="notify-verify-code"
+              maxlength="16"
+              autocomplete="one-time-code"
+              placeholder="请输入验证码"
+            /><button id="submit-notify-verify" class="button primary" type="button">确认</button>
+          </div>
+        </div>
+        <button id="bind-weixin" class="button secondary full-width" type="button" hidden>
+          获取二维码
+        </button>
+        <button id="finish-notification" class="button primary full-width" type="button" hidden>
+          确认
+        </button>
+        <a id="notification-back" class="muted-link setup-back" href="/tasks?setup=1" hidden
+          >返回签到设置</a
+        >
+      </section>
+    </main>
+    {{site-footer}}
+    <dialog id="setup-success" class="success-dialog" aria-labelledby="success-title">
+      <canvas id="celebration-canvas" aria-hidden="true"></canvas>
+      <div class="success-card">
+        <div class="success-medallion" aria-hidden="true">
+          <svg viewBox="0 0 64 64" fill="none">
+            <circle class="success-ring" cx="32" cy="32" r="28" />
+            <path class="success-check" d="M19 33l9 9 18-20" />
+          </svg>
+        </div>
+        <h2 id="success-title">配置完成</h2>
+        <button id="enter-account" class="button primary" type="button">进入用户页面</button>
+      </div>
+    </dialog>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>

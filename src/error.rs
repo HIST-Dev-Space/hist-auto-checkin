@@ -17,6 +17,8 @@ pub enum AppError {
     NotFound,
     #[error("{0}")]
     Conflict(String),
+    #[error("登录正在处理，请稍后重试")]
+    LoginSessionBusy,
     #[error("请求过于频繁，请稍后重试")]
     RateLimited,
     #[error("{0}")]
@@ -46,6 +48,7 @@ impl IntoResponse for AppError {
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::LoginSessionBusy => StatusCode::CONFLICT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::Upstream(_) => StatusCode::BAD_GATEWAY,
             Self::SchoolSessionExchange(_) => StatusCode::BAD_GATEWAY,
@@ -56,6 +59,8 @@ impl IntoResponse for AppError {
         };
         let body = if matches!(&self, Self::SchoolSessionExchange(_)) {
             json!({"error":self.to_string(),"code":"school_session_exchange_failed","scan_confirmed":true})
+        } else if matches!(&self, Self::LoginSessionBusy) {
+            json!({"error":self.to_string(),"code":"login_session_busy"})
         } else {
             json!({"error":self.to_string()})
         };

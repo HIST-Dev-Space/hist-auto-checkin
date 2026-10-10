@@ -22,9 +22,12 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(crate::web::index))
         .route("/community", get(crate::web::community))
+        .route("/start", get(crate::web::start))
         .route("/login", get(crate::web::login))
         .route("/tasks", get(crate::web::tasks))
-        .route("/assets/{name}", get(crate::web::asset))
+        .route("/notifications", get(crate::web::notifications))
+        .route("/account", get(crate::web::account))
+        .route("/assets/{*name}", get(crate::web::asset))
         .route("/api/locations", get(crate::web::locations))
         .route("/api/school-login/start", post(crate::school_login::start))
         .route(
@@ -41,6 +44,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/me", get(me))
+        .route("/api/dashboard", get(dashboard))
+        .route("/api/auto-checkin", put(set_auto_checkin))
         .route("/api/school-accounts", get(accounts).post(create_account))
         .route(
             "/api/school-accounts/{id}/credentials",
@@ -220,26 +225,131 @@ fn numeric_id(value: &str) -> bool {
 fn default_timezone() -> String {
     "Asia/Shanghai".into()
 }
-fn default_window() -> i32 {
-    10
+fn default_weekdays() -> Vec<i32> {
+    (1..=7).collect()
 }
 fn default_enabled() -> bool {
     true
 }
 
+async fn dashboard(AuthUser(user): AuthUser, State(state): State<AppState>) -> Result<Json<Value>> {
+    let value: DbJson<Value> = sqlx::query_scalar(
+        r#"WITH day AS (
+            SELECT date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai' AS start
+        ), checkins AS (
+            SELECT count(*) AS total,
+                count(*) FILTER (WHERE r.updated_at >= day.start AND r.updated_at < day.start + interval '1 day') AS today
+            FROM checkin_records r JOIN school_accounts a ON a.id=r.school_account_id CROSS JOIN day
+            WHERE a.user_id=$1 AND r.status='succeeded'
+        ), today_jobs AS (
+            SELECT count(*) FILTER (WHERE status='succeeded') AS succeeded,
+                count(*) FILTER (WHERE status IN ('pending','running')) AS running,
+                count(*) FILTER (WHERE status='failed') AS failed
+            FROM checkin_jobs CROSS JOIN day
+            WHERE user_id=$1 AND scheduled_at >= day.start AND scheduled_at < day.start + interval '1 day'
+        ), settings AS (
+            SELECT count(*) > 0 AS configured, COALESCE(bool_or(enabled), false) AS enabled
+            FROM checkin_schedules WHERE user_id=$1
+        ), school AS (
+            SELECT EXISTS(SELECT 1 FROM school_accounts WHERE user_id=$1 AND credential_status='active') AS active
+        )
+        SELECT jsonb_build_object(
+            'total_successful_checkins',checkins.total,
+            'today_successful_checkins',checkins.today,
+            'today_status',CASE
+                WHEN checkins.today > 0 OR today_jobs.succeeded > 0 THEN 'success'
+                WHEN today_jobs.running > 0 THEN 'running'
+                WHEN NOT school.active THEN 'login_required'
+                WHEN NOT settings.configured THEN 'unconfigured'
+                WHEN NOT settings.enabled THEN 'paused'
+                WHEN today_jobs.failed > 0 THEN 'failed'
+                ELSE 'waiting' END,
+            'auto_checkin_enabled',settings.enabled,
+            'has_schedule',settings.configured,
+            'has_active_account',school.active,
+            'account_label',COALESCE((SELECT label FROM school_accounts WHERE user_id=$1 ORDER BY (credential_status='active') DESC,created_at DESC LIMIT 1),'我的账号')
+        ) FROM checkins,today_jobs,settings,school"#,
+    )
+    .bind(user)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(Json(value.0))
+}
+
+#[derive(Deserialize)]
+struct AutoCheckinInput {
+    enabled: bool,
+}
+
+async fn set_auto_checkin(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+    Json(input): Json<AutoCheckinInput>,
+) -> Result<Json<Value>> {
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
+        .bind(user)
+        .execute(&mut *tx)
+        .await?;
+    let rules: Vec<ScheduleRow> = sqlx::query_as(
+        "SELECT * FROM checkin_schedules WHERE user_id=$1 ORDER BY created_at FOR UPDATE",
+    )
+    .bind(user)
+    .fetch_all(&mut *tx)
+    .await?;
+    if rules.is_empty() {
+        return Err(AppError::Conflict("请先设置签到时间和地点".into()));
+    }
+    if input.enabled {
+        let active: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM school_accounts WHERE user_id=$1 AND credential_status='active'",
+        )
+        .bind(user)
+        .fetch_all(&mut *tx)
+        .await?;
+        if !rules
+            .iter()
+            .any(|rule| active.contains(&rule.school_account_id))
+        {
+            return Err(AppError::Conflict("请先重新登录学校账号".into()));
+        }
+        for rule in rules
+            .iter()
+            .filter(|rule| active.contains(&rule.school_account_id))
+        {
+            let next = next_run(rule.local_time, &rule.timezone, &rule.weekdays, Utc::now())?;
+            sqlx::query("UPDATE checkin_schedules SET enabled=true,next_run_at=$1 WHERE id=$2")
+                .bind(next)
+                .bind(rule.id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    } else {
+        sqlx::query("UPDATE checkin_schedules SET enabled=false WHERE user_id=$1")
+            .bind(user)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE checkin_jobs SET status='cancelled',finished_at=now(),result_message='自动签到已关闭' WHERE user_id=$1 AND status='pending'")
+            .bind(user).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    dashboard(AuthUser(user), State(state)).await
+}
+
 #[derive(Deserialize)]
 struct ScheduleInput {
     school_account_id: Uuid,
+    // An omitted or empty list discovers the current school task at execution time.
+    #[serde(default)]
     course_ids: Vec<String>,
     local_time: String,
     #[serde(default = "default_timezone")]
     timezone: String,
+    #[serde(default = "default_weekdays")]
     weekdays: Vec<i32>,
     latitude: f64,
     longitude: f64,
     location_name: String,
-    #[serde(default = "default_window")]
-    retry_window_minutes: i32,
     #[serde(default = "default_enabled")]
     enabled: bool,
 }
@@ -256,22 +366,18 @@ pub struct ScheduleRow {
     pub latitude: f64,
     pub longitude: f64,
     pub location_name: String,
-    pub retry_window_minutes: i32,
     pub enabled: bool,
     pub next_run_at: DateTime<Utc>,
 }
 
 fn validate_schedule(input: &ScheduleInput) -> Result<(NaiveTime, DateTime<Utc>)> {
-    if input.course_ids.is_empty()
-        || input.course_ids.len() > 20
+    if input.course_ids.len() > 20
         || !input.course_ids.iter().all(|id| numeric_id(id))
         || input.weekdays.is_empty()
         || input.weekdays.len() > 7
         || !input.weekdays.iter().all(|d| (1..=7).contains(d))
     {
-        return Err(AppError::BadRequest(
-            "请选择 1..20 个课程和有效星期（周一为 1、周日为 7）".into(),
-        ));
+        return Err(AppError::BadRequest("课程或重复星期无效".into()));
     }
     if !input.latitude.is_finite()
         || !input.longitude.is_finite()
@@ -279,9 +385,8 @@ fn validate_schedule(input: &ScheduleInput) -> Result<(NaiveTime, DateTime<Utc>)
         || !(-180.0..=180.0).contains(&input.longitude)
         || input.location_name.trim().is_empty()
         || input.location_name.len() > 128
-        || !(1..=60).contains(&input.retry_window_minutes)
     {
-        return Err(AppError::BadRequest("地点或重试窗口无效".into()));
+        return Err(AppError::BadRequest("地点无效".into()));
     }
     let time = NaiveTime::parse_from_str(&input.local_time, "%H:%M")
         .or_else(|_| NaiveTime::parse_from_str(&input.local_time, "%H:%M:%S"))
@@ -326,8 +431,8 @@ async fn create_schedule(
     if count >= 100 {
         return Err(AppError::Conflict("每个用户最多创建 100 个签到规则".into()));
     }
-    sqlx::query("INSERT INTO checkin_schedules(id,user_id,school_account_id,course_ids,local_time,timezone,weekdays,latitude,longitude,location_name,retry_window_minutes,enabled,next_run_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)")
-        .bind(id).bind(user).bind(input.school_account_id).bind(input.course_ids).bind(time).bind(input.timezone).bind(input.weekdays).bind(input.latitude).bind(input.longitude).bind(input.location_name.trim()).bind(input.retry_window_minutes).bind(input.enabled).bind(next).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO checkin_schedules(id,user_id,school_account_id,course_ids,local_time,timezone,weekdays,latitude,longitude,location_name,enabled,next_run_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)")
+        .bind(id).bind(user).bind(input.school_account_id).bind(input.course_ids).bind(time).bind(input.timezone).bind(input.weekdays).bind(input.latitude).bind(input.longitude).bind(input.location_name.trim()).bind(input.enabled).bind(next).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok((
         StatusCode::CREATED,
@@ -361,8 +466,8 @@ async fn update_schedule(
     if running {
         return Err(AppError::Conflict("该规则正在执行，请稍后修改".into()));
     }
-    sqlx::query("UPDATE checkin_schedules SET school_account_id=$1,course_ids=$2,local_time=$3,timezone=$4,weekdays=$5,latitude=$6,longitude=$7,location_name=$8,retry_window_minutes=$9,enabled=$10,next_run_at=$11 WHERE id=$12")
-        .bind(input.school_account_id).bind(input.course_ids).bind(time).bind(input.timezone).bind(input.weekdays).bind(input.latitude).bind(input.longitude).bind(input.location_name.trim()).bind(input.retry_window_minutes).bind(input.enabled).bind(next).bind(id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE checkin_schedules SET school_account_id=$1,course_ids=$2,local_time=$3,timezone=$4,weekdays=$5,latitude=$6,longitude=$7,location_name=$8,enabled=$9,next_run_at=$10 WHERE id=$11")
+        .bind(input.school_account_id).bind(input.course_ids).bind(time).bind(input.timezone).bind(input.weekdays).bind(input.latitude).bind(input.longitude).bind(input.location_name.trim()).bind(input.enabled).bind(next).bind(id).execute(&mut *tx).await?;
     sqlx::query("UPDATE checkin_jobs SET status='cancelled',finished_at=now(),result_message='规则已修改' WHERE schedule_id=$1 AND status='pending'").bind(id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(Json(json!({"id":id,"next_run_at":next})))
@@ -378,7 +483,7 @@ async fn run_schedule(
     let schedule: ScheduleRow = sqlx::query_as("SELECT s.* FROM checkin_schedules s JOIN school_accounts a ON a.id=s.school_account_id WHERE s.id=$1 AND s.user_id=$2 AND s.enabled AND a.credential_status='active' FOR UPDATE OF s").bind(id).bind(user).fetch_optional(&mut *tx).await?.ok_or(AppError::NotFound)?;
     let job = Uuid::new_v4();
     let now = Utc::now();
-    sqlx::query("INSERT INTO checkin_jobs(id,schedule_id,user_id,school_account_id,scheduled_at,available_at,deadline_at) VALUES($1,$2,$3,$4,$5,$5,$6)").bind(job).bind(id).bind(user).bind(schedule.school_account_id).bind(now).bind(now+Duration::minutes(i64::from(schedule.retry_window_minutes))).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO checkin_jobs(id,schedule_id,user_id,school_account_id,scheduled_at,available_at) VALUES($1,$2,$3,$4,$5,$5)").bind(job).bind(id).bind(user).bind(schedule.school_account_id).bind(now).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok((StatusCode::ACCEPTED, Json(json!({"job_id":job}))))
 }
@@ -394,7 +499,7 @@ async fn jobs(
     Query(query): Query<JobQuery>,
 ) -> Result<Json<Value>> {
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
-    let values: Vec<DbJson<Value>> = sqlx::query_scalar("SELECT jsonb_build_object('id',j.id,'schedule_id',j.schedule_id,'scheduled_at',j.scheduled_at,'status',j.status,'attempts',j.attempts,'message',j.result_message,'finished_at',j.finished_at,'notification_status',n.status,'notification_error',n.last_error,'records',COALESCE((SELECT jsonb_agg(jsonb_build_object('course_id',r.course_id,'punch_id',r.punch_id,'status',r.status,'message',r.message,'latitude',r.latitude,'longitude',r.longitude)) FROM checkin_records r WHERE r.job_id=j.id),'[]'::jsonb)) FROM checkin_jobs j LEFT JOIN notification_outbox n ON n.job_id=j.id WHERE j.user_id=$1 AND ($2::timestamptz IS NULL OR j.scheduled_at<$2) ORDER BY j.scheduled_at DESC LIMIT $3").bind(user).bind(query.before).bind(limit).fetch_all(&state.db).await?;
+    let values: Vec<DbJson<Value>> = sqlx::query_scalar("SELECT jsonb_build_object('id',j.id,'schedule_id',j.schedule_id,'scheduled_at',j.scheduled_at,'status',j.status,'attempts',j.attempts,'message',j.result_message,'finished_at',j.finished_at,'notification_status',n.status,'notification_error',n.last_error,'records',COALESCE((SELECT jsonb_agg(jsonb_build_object('course_id',r.course_id,'punch_id',r.punch_id,'title',r.task_title,'status',r.status,'message',r.message,'latitude',r.latitude,'longitude',r.longitude)) FROM checkin_records r WHERE r.job_id=j.id),'[]'::jsonb)) FROM checkin_jobs j LEFT JOIN notification_outbox n ON n.job_id=j.id WHERE j.user_id=$1 AND ($2::timestamptz IS NULL OR j.scheduled_at<$2) ORDER BY j.scheduled_at DESC LIMIT $3").bind(user).bind(query.before).bind(limit).fetch_all(&state.db).await?;
     Ok(Json(
         json!({"jobs":values.into_iter().map(|v|v.0).collect::<Vec<_>>()}),
     ))

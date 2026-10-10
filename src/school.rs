@@ -1,6 +1,6 @@
 use regex::Regex;
 use reqwest::{Client, Url, cookie::Jar};
-use scraper::{Html, Selector};
+use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -12,6 +12,15 @@ static COURSE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"/student/course/(\d+)(?:/|$|[?#])").unwrap());
 static PUNCH_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"/punchw/(?:course/)?(\d+)/(\d+)|/student/course/(\d+)/punchw/(\d+)").unwrap()
+});
+static EXPLICIT_TASK_TITLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[A-Za-z0-9\u{4E00}-\u{9FFF}·（）()《》【】\-_]{2,40}签到").unwrap()
+});
+static ACTION_TITLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:点击(?:此处)?(?:完成)?|点此(?:去)?(?:完成)?|去|立即|马上|开始|完成).{0,4}签到$",
+    )
+    .unwrap()
 });
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -190,9 +199,14 @@ impl SchoolClient {
     }
 
     pub async fn tasks(&self, courses: &[String]) -> Result<Vec<PunchTask>, SchoolError> {
-        let available: HashSet<_> = self.courses().await?.into_iter().collect();
+        let available = self.courses().await?;
+        let selected = if courses.is_empty() {
+            available.as_slice()
+        } else {
+            courses
+        };
         let mut tasks = Vec::new();
-        for course in courses {
+        for course in selected {
             if !available.contains(course) {
                 return Err(SchoolError::Rejected(format!("账号未加入课程 {course}")));
             }
@@ -203,7 +217,15 @@ impl SchoolClient {
                         .map_err(|_| SchoolError::Unavailable)?,
                 )
                 .await?;
-            tasks.extend(parse_tasks(&self.base, course, &html));
+            let found = parse_tasks(&self.base, course, &html);
+            if courses.is_empty() {
+                // Match hist-checkin: discover the first current task automatically.
+                if let Some(task) = found.into_iter().next() {
+                    return Ok(vec![task]);
+                }
+            } else {
+                tasks.extend(found);
+            }
         }
         Ok(tasks)
     }
@@ -378,6 +400,64 @@ pub fn course_items(html: &str) -> Vec<CourseItem> {
         .collect()
 }
 
+fn usable_task_title(text: &str) -> Option<String> {
+    let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized: String = title.split_whitespace().collect();
+    if normalized.is_empty()
+        || [
+            "签到",
+            "正在进行的签到",
+            "正在进行",
+            "进行中",
+            "签到中",
+            "待签到",
+            "已签到",
+        ]
+        .contains(&normalized.as_str())
+        || ACTION_TITLE_RE.is_match(&normalized)
+    {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+fn task_title(context: ElementRef<'_>, link: ElementRef<'_>) -> String {
+    // Match hist-checkin's card metadata extraction, using the parsed DOM so
+    // nested elements and distant action links remain within the same task.
+    if let Some(title) = context
+        .value()
+        .attr("data-title")
+        .and_then(usable_task_title)
+    {
+        return title;
+    }
+    for pattern in [
+        "[data-title]",
+        "div[class*='title'],span[class*='title'],div[class*='name'],span[class*='name'],.font-weight-bold",
+        "h1,h2,h3,h4,strong,b",
+    ] {
+        let selector = Selector::parse(pattern).unwrap();
+        for element in context.select(&selector) {
+            let raw = element
+                .value()
+                .attr("data-title")
+                .map(str::to_owned)
+                .unwrap_or_else(|| element.text().collect());
+            if let Some(title) = usable_task_title(&raw) {
+                return title;
+            }
+        }
+    }
+    let text = context.text().collect::<Vec<_>>().join(" ");
+    for found in EXPLICIT_TASK_TITLE_RE.find_iter(&text) {
+        if let Some(title) = usable_task_title(found.as_str()) {
+            return title;
+        }
+    }
+    usable_task_title(&link.text().collect::<String>()).unwrap_or_else(|| "签到任务".into())
+}
+
 pub fn parse_tasks(base: &Url, course: &str, html: &str) -> Vec<PunchTask> {
     let doc = Html::parse_document(html);
     let selector = Selector::parse("a[href]").unwrap();
@@ -413,16 +493,18 @@ pub fn parse_tasks(base: &Url, course: &str, html: &str) -> Vec<PunchTask> {
                     .find(|(k, _)| k == "punchid" || k == "punch_id" || k == "id")
                     .map(|(_, v)| v.to_string())?
             };
-            let title = link.text().collect::<String>().trim().to_owned();
-            let context = link
-                .ancestors()
-                .filter_map(scraper::ElementRef::wrap)
-                .find(|e| e.value().classes().any(|c| c == "punch-card"))
-                .map(|e| e.text().collect::<String>())
-                .unwrap_or_else(|| title.clone());
+            let context = ["punch-card", "card", "card-body"]
+                .iter()
+                .find_map(|class| {
+                    link.ancestors()
+                        .filter_map(ElementRef::wrap)
+                        .find(|e| e.value().classes().any(|c| c == *class))
+                })
+                .unwrap_or(link);
+            let context_text = context.text().collect::<String>();
             if ["已结束", "已关闭", "未开始", "已签到过"]
                 .iter()
-                .any(|s| context.contains(s))
+                .any(|s| context_text.contains(s))
                 || !seen.insert(punch_id.clone())
             {
                 return None;
@@ -430,7 +512,7 @@ pub fn parse_tasks(base: &Url, course: &str, html: &str) -> Vec<PunchTask> {
             Some(PunchTask {
                 course_id: course.into(),
                 punch_id,
-                title,
+                title: task_title(context, link),
                 url,
             })
         })
@@ -460,6 +542,92 @@ mod tests {
             vec!["12"]
         );
     }
+    #[test]
+    fn reads_whole_card_titles_instead_of_generic_action_links() {
+        let base = Url::parse("https://school.example").unwrap();
+        let html = format!(
+            r#"
+            <div class="card punch-card punch-card--primary">
+                <div class="card-body">
+                    <div class="punch-status">正在进行</div>
+                    <div class="mt-2 font-weight-bold">2024级学生每晚考勤</div>
+                    <div class="filler">{}</div>
+                    <a href="/student/punchw/course/12/30?sid=4">点此去完成签到</a>
+                </div>
+            </div>
+            <div class="card punch-card">
+                <div class="title">高等数学签到</div>
+                <a href="/student/punchw/course/12/31">点击此处完成签到</a>
+            </div>
+            <div class="card punch-card">
+                <div class="title">大学英语签到</div>
+                已结束<a href="/student/punchw/course/12/32">签到</a>
+            </div>
+        "#,
+            "x".repeat(4500)
+        );
+        let tasks = parse_tasks(&base, "12", &html);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].title, "2024级学生每晚考勤");
+        assert_eq!(tasks[1].title, "高等数学签到");
+        assert_eq!(tasks[0].punch_id, "30");
+        assert_eq!(tasks[1].punch_id, "31");
+    }
+
+    #[test]
+    fn extracts_title_variants_and_decodes_html_entities() {
+        let base = Url::parse("https://school.example").unwrap();
+        for (markup, expected) in [
+            (
+                "<div class='punch-card' data-title='晚间 &amp; 宿舍考勤'>LINK</div>",
+                "晚间 & 宿舍考勤",
+            ),
+            (
+                "<div class='punch-card'><span data-title='宿舍晚间考勤'></span>LINK</div>",
+                "宿舍晚间考勤",
+            ),
+            (
+                "<div class='punch-card'><h2>期末<span>考勤</span>（晚间）</h2>LINK</div>",
+                "期末考勤（晚间）",
+            ),
+            (
+                "<div class='card'><div class='card-body'><span class='task-name'>实验课考勤</span></div>LINK</div>",
+                "实验课考勤",
+            ),
+            (
+                "<div class='card-body'><div class='title'>大学英语签到</div>LINK</div>",
+                "大学英语签到",
+            ),
+            (
+                "<div class='punch-card'>高等数学签到 正在进行 LINK</div>",
+                "高等数学签到",
+            ),
+        ] {
+            let html = markup.replace(
+                "LINK",
+                "<a href='/student/punchw/course/12/30'>立即签到</a>",
+            );
+            let tasks = parse_tasks(&base, "12", &html);
+            assert_eq!(tasks.len(), 1, "{html}");
+            assert_eq!(tasks[0].title, expected, "{html}");
+        }
+    }
+
+    #[test]
+    fn generic_action_links_do_not_become_task_titles() {
+        let base = Url::parse("https://school.example").unwrap();
+        for action in [
+            "签到",
+            "立即签到",
+            "点击此处完成签到",
+            "点此去完成签到",
+            "正在进行的签到",
+        ] {
+            let html = format!("<a href='/student/punchw/course/12/30'>{action}</a>");
+            assert_eq!(parse_tasks(&base, "12", &html)[0].title, "签到任务");
+        }
+    }
+
     #[test]
     fn ambiguous_response_requires_verification() {
         assert!(matches!(

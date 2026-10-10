@@ -1,3 +1,3 @@
-# Hist-Auto-Checkin服务
+# Hist-Auto-Checkin
 
 微学工登录 -> 设置签到时间和地点 -> 每日自动签到 -> 微信通知签到结果

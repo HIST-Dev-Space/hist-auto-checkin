@@ -13,7 +13,7 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use cookie_store::{CookieExpiration, CookieStore};
 use rand::{RngCore, rngs::OsRng};
 use regex::Regex;
@@ -361,6 +361,24 @@ fn random_secret() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+fn login_cookie(method: &str) -> &'static str {
+    if method == "identity" {
+        "hist_school_identity_login"
+    } else {
+        "hist_school_login"
+    }
+}
+
+fn login_capability<'a>(headers: &'a HeaderMap, method: &str) -> Result<(Uuid, &'a str)> {
+    let cookie = auth::cookie_value(headers, login_cookie(method)).ok_or(AppError::Unauthorized)?;
+    let (id, secret) = cookie.split_once('.').ok_or(AppError::Unauthorized)?;
+    Ok((id.parse().map_err(|_| AppError::Unauthorized)?, secret))
+}
+
+fn captcha_reusable_until(expires_at: DateTime<Utc>) -> DateTime<Utc> {
+    expires_at.min(Utc::now() + Duration::seconds(60))
+}
+
 #[derive(Deserialize)]
 pub struct StartInput {
     pub method: String,
@@ -385,24 +403,38 @@ pub async fn start(
     )
     .await?;
     let client = LoginClient::new(&state, "[]")?;
-    let mut payload = json!({"method":input.method,"expires_at":Utc::now()+Duration::minutes(5)});
+    let mut payload = json!({"method":input.method});
     if input.method == "wechat" {
         payload["qr_content"] = json!(client.qr().await?);
     } else {
         payload["captcha_data_url"] = json!(client.captcha().await?);
     }
+    let expires_at = Utc::now() + Duration::minutes(5);
     let id = Uuid::new_v4();
     let secret = random_secret();
     let jar = state
         .secrets
         .encrypt(&client.jar.snapshot()?, &format!("school-login:{id}"))?;
-    sqlx::query("INSERT INTO school_login_sessions(id,secret_hash,jar_ciphertext,method,expires_at) VALUES($1,$2,$3,$4,$5)")
-        .bind(id).bind(auth::token_hash(&secret)).bind(jar).bind(input.method).bind(Utc::now()+Duration::minutes(5)).execute(&state.db).await?;
+    let mut tx = state.db.begin().await?;
+    let expires_at: DateTime<Utc> = sqlx::query_scalar("INSERT INTO school_login_sessions(id,secret_hash,jar_ciphertext,method,expires_at) VALUES($1,$2,$3,$4,$5) RETURNING expires_at")
+        .bind(id).bind(auth::token_hash(&secret)).bind(jar).bind(&input.method).bind(expires_at).fetch_one(&mut *tx).await?;
+    if let Ok((previous_id, previous_secret)) = login_capability(&headers, &input.method) {
+        sqlx::query("DELETE FROM school_login_sessions WHERE id=$1 AND secret_hash=$2")
+            .bind(previous_id)
+            .bind(auth::token_hash(previous_secret))
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    payload["expires_at"] = json!(expires_at);
+    if input.method == "identity" {
+        payload["reusable_until"] = json!(captcha_reusable_until(expires_at));
+    }
     Ok(response(
         payload,
         vec![session_cookie(
             &state,
-            "hist_school_login",
+            login_cookie(&input.method),
             &format!("{id}.{secret}"),
             300,
         )],
@@ -416,14 +448,43 @@ struct LoginLease {
     method: String,
     lease_token: Option<Uuid>,
     callback_ciphertext: Option<String>,
+    expires_at: DateTime<Utc>,
+    #[sqlx(skip)]
+    secret: String,
+    #[sqlx(skip)]
+    other_session: Option<(Uuid, Vec<u8>)>,
 }
-async fn claim(state: &AppState, headers: &HeaderMap) -> Result<(LoginLease, LoginClient)> {
+async fn claim(
+    state: &AppState,
+    headers: &HeaderMap,
+    method: &str,
+) -> Result<(LoginLease, LoginClient)> {
     web_request(headers)?;
-    let cookie = auth::cookie_value(headers, "hist_school_login").ok_or(AppError::Unauthorized)?;
-    let (id, secret) = cookie.split_once('.').ok_or(AppError::Unauthorized)?;
-    let id: Uuid = id.parse().map_err(|_| AppError::Unauthorized)?;
-    let lease=sqlx::query_as::<_,LoginLease>("UPDATE school_login_sessions SET lease_token=$1,lease_until=now()+interval '120 seconds' WHERE id=$2 AND secret_hash=$3 AND expires_at>now() AND (lease_until IS NULL OR lease_until<=now()) RETURNING *")
-        .bind(Uuid::new_v4()).bind(id).bind(auth::token_hash(secret)).fetch_optional(&state.db).await?.ok_or_else(||AppError::Conflict("登录已过期或正在处理，请稍后刷新重试".into()))?;
+    let (id, secret) = login_capability(headers, method)?;
+    let lease=sqlx::query_as::<_,LoginLease>("UPDATE school_login_sessions SET lease_token=$1,lease_until=now()+interval '120 seconds' WHERE id=$2 AND secret_hash=$3 AND method=$4 AND expires_at>now() AND (lease_until IS NULL OR lease_until<=now()) RETURNING *")
+        .bind(Uuid::new_v4()).bind(id).bind(auth::token_hash(secret)).bind(method).fetch_optional(&state.db).await?;
+    let mut lease = match lease {
+        Some(lease) => lease,
+        None => {
+            let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM school_login_sessions WHERE id=$1 AND secret_hash=$2 AND method=$3 AND expires_at>now())")
+                .bind(id).bind(auth::token_hash(secret)).bind(method).fetch_one(&state.db).await?;
+            return Err(if valid {
+                AppError::LoginSessionBusy
+            } else {
+                AppError::Unauthorized
+            });
+        }
+    };
+    lease.secret = secret.to_owned();
+    let other_method = if method == "wechat" {
+        "identity"
+    } else {
+        "wechat"
+    };
+    lease.other_session = login_capability(headers, other_method)
+        .ok()
+        .filter(|(other_id, _)| *other_id != id)
+        .map(|(other_id, other_secret)| (other_id, auth::token_hash(other_secret)));
     let client = LoginClient::new(
         state,
         &state
@@ -442,11 +503,17 @@ async fn persist(state: &AppState, lease: &LoginLease, client: &LoginClient) -> 
 }
 
 pub async fn captcha(State(state): State<AppState>, headers: HeaderMap) -> Result<Response> {
-    let (lease, client) = claim(&state, &headers).await?;
-    auth::rate_limit(&state, &format!("captcha:{}", lease.id), 20).await?;
-    let result = client.captcha().await;
+    let (lease, client) = claim(&state, &headers, "identity").await?;
+    let result = async {
+        auth::rate_limit(&state, &format!("captcha:{}", lease.id), 20).await?;
+        client.captcha().await
+    }
+    .await;
     persist(&state, &lease, &client).await?;
-    Ok(response(json!({"captcha_data_url":result?}), vec![]))
+    Ok(response(
+        json!({"captcha_data_url":result?,"expires_at":lease.expires_at,"reusable_until":captcha_reusable_until(lease.expires_at)}),
+        vec![],
+    ))
 }
 
 #[derive(Deserialize)]
@@ -474,9 +541,12 @@ pub async fn identity(
     {
         return Err(AppError::BadRequest("请输入姓名、学号和图片验证码".into()));
     }
-    let (lease, client) = claim(&state, &headers).await?;
-    auth::rate_limit(&state, &format!("identity:{}", lease.id), 10).await?;
-    let result = identity_inner(&state, &lease, &client, &input).await;
+    let (lease, client) = claim(&state, &headers, "identity").await?;
+    let result = async {
+        auth::rate_limit(&state, &format!("identity:{}", lease.id), 10).await?;
+        identity_inner(&state, &lease, &client, &input).await
+    }
+    .await;
     persist(&state, &lease, &client).await?;
     result
 }
@@ -518,9 +588,24 @@ async fn identity_inner(
         .bind(lease.lease_token)
         .execute(&state.db)
         .await?;
+        if let Some((id, secret_hash)) = &lease.other_session {
+            sqlx::query("DELETE FROM school_login_sessions WHERE id=$1 AND secret_hash=$2")
+                .bind(id)
+                .bind(secret_hash)
+                .execute(&state.db)
+                .await?;
+        }
         return Ok(super::school_login::response(
-            json!({"status":"need_wechat","qr_content":qr,"message":"该学校账号已绑定微信，请扫码完成验证"}),
-            vec![],
+            json!({"status":"need_wechat","qr_content":qr,"expires_at":lease.expires_at,"message":"该账号已绑定微信，请扫码完成验证"}),
+            vec![
+                session_cookie(
+                    state,
+                    login_cookie("wechat"),
+                    &format!("{}.{}", lease.id, lease.secret),
+                    (lease.expires_at - Utc::now()).num_seconds().max(0) as u32,
+                ),
+                session_cookie(state, login_cookie("identity"), "", 0),
+            ],
         ));
     }
     if text.contains("验证码错误") {
@@ -547,9 +632,12 @@ async fn identity_inner(
 }
 
 pub async fn poll(State(state): State<AppState>, headers: HeaderMap) -> Result<Response> {
-    let (lease, client) = claim(&state, &headers).await?;
-    auth::rate_limit(&state, &format!("school-qr-poll:{}", lease.id), 200).await?;
-    let result = poll_inner(&state, &lease, &client).await;
+    let (lease, client) = claim(&state, &headers, "wechat").await?;
+    let result = async {
+        auth::rate_limit(&state, &format!("school-qr-poll:{}", lease.id), 200).await?;
+        poll_inner(&state, &lease, &client).await
+    }
+    .await;
     persist(&state, &lease, &client).await?;
     result
 }
@@ -611,8 +699,14 @@ async fn complete(
     identity: Option<(&str, &str)>,
 ) -> Result<Response> {
     let mut tx = state.db.begin().await?;
-    let owned: Option<Uuid>=sqlx::query_scalar("SELECT id FROM school_login_sessions WHERE id=$1 AND lease_token=$2 AND expires_at>now() FOR UPDATE").bind(lease.id).bind(lease.lease_token).fetch_optional(&mut *tx).await?;
-    if owned.is_none() {
+    // Lock both authenticated capabilities in a stable order so only one login can finish.
+    let other_id = lease.other_session.as_ref().map(|(id, _)| *id);
+    let other_hash = lease.other_session.as_ref().map(|(_, hash)| hash);
+    let sessions: Vec<(Uuid, Option<Uuid>, DateTime<Utc>)> = sqlx::query_as("SELECT id,lease_token,expires_at FROM school_login_sessions WHERE id=$1 OR (id=$2 AND secret_hash=$3) ORDER BY id FOR UPDATE")
+        .bind(lease.id).bind(other_id).bind(other_hash).fetch_all(&mut *tx).await?;
+    if !sessions.iter().any(|(id, token, expires)| {
+        *id == lease.id && *token == lease.lease_token && *expires > Utc::now()
+    }) {
         return Err(AppError::Unauthorized);
     }
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
@@ -686,8 +780,8 @@ async fn complete(
         .bind(Utc::now() + Duration::days(30))
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM school_login_sessions WHERE id=$1")
-        .bind(lease.id)
+    sqlx::query("DELETE FROM school_login_sessions WHERE id=ANY($1)")
+        .bind(sessions.iter().map(|(id, _, _)| *id).collect::<Vec<_>>())
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -696,6 +790,7 @@ async fn complete(
         vec![
             session_cookie(state, "hist_session", &token, 30 * 86400),
             session_cookie(state, "hist_school_login", "", 0),
+            session_cookie(state, "hist_school_identity_login", "", 0),
         ],
     ))
 }
