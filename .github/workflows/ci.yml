@@ -52,3 +52,26 @@ jobs:
           archive: false
           if-no-files-found: error
           retention-days: 30
+  release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download backend
+        uses: actions/download-artifact@v8
+        with:
+          name: hist-auto-ckeckin-linux-x86_64.tar.gz
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            hist-auto-ckeckin-linux-x86_64.tar.gz \
+            --verify-tag \
+            --title "$RELEASE_TAG" \
+            --generate-notes
