@@ -1,0 +1,17 @@
+[Unit]
+Description=Hist Auto Checkin backend
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=hist
+Group=hist
+WorkingDirectory=/opt/hist-auto-ckeckin
+ExecStart=/opt/hist-auto-ckeckin/target/release/hist-auto-ckeckin
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=40s
+
+[Install]
+WantedBy=multi-user.target

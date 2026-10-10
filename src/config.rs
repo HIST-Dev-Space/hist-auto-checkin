@@ -24,7 +24,7 @@ impl Config {
         let config = Self {
             database_url: env::var("DATABASE_URL")?,
             credential_key: env::var("CREDENTIAL_KEY_BASE64")?,
-            bind_addr: value("BIND_ADDR", "0.0.0.0:38080").parse()?,
+            bind_addr: value("BIND_ADDR", "0.0.0.0:9966").parse()?,
             allow_registration: value("ALLOW_REGISTRATION", "true").parse()?,
             auth_rate_limit: value("AUTH_RATE_LIMIT_PER_IP", "120").parse()?,
             trusted_proxies: value("TRUSTED_PROXY_CIDRS", "")

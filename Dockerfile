@@ -13,5 +13,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && useradd --system --uid 10001 --create-home hist
 COPY --from=builder /build/target/release/hist-auto-ckeckin /usr/local/bin/hist-auto-ckeckin
 USER hist
-EXPOSE 38080
+EXPOSE 9966
 ENTRYPOINT ["hist-auto-ckeckin"]

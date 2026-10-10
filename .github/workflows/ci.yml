@@ -1,5 +1,10 @@
-name: Rust checks
-on: [push, pull_request]
+name: Rust checks and build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -10,12 +15,13 @@ jobs:
           POSTGRES_USER: hist
           POSTGRES_PASSWORD: test-only
           POSTGRES_DB: hist
-        ports: [5432:5432]
+          PGPORT: "9669"
+        ports: [9669:9669]
         options: >-
-          --health-cmd "pg_isready -U hist -d hist"
+          --health-cmd "pg_isready -U hist -d hist -p 9669"
           --health-interval 5s --health-timeout 3s --health-retries 20
     env:
-      DATABASE_URL: postgres://hist:test-only@127.0.0.1:5432/hist
+      DATABASE_URL: postgres://hist:test-only@127.0.0.1:9669/hist
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -24,3 +30,25 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets --locked
+  build:
+    name: Build Linux x86_64 backend
+    needs: check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Build release backend
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+      - name: Package backend
+        run: |
+          tar -czf hist-auto-ckeckin-linux-x86_64.tar.gz \
+            -C target/x86_64-unknown-linux-gnu/release hist-auto-ckeckin
+      - name: Upload backend
+        uses: actions/upload-artifact@v7
+        with:
+          path: hist-auto-ckeckin-linux-x86_64.tar.gz
+          archive: false
+          if-no-files-found: error
+          retention-days: 30

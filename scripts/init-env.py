@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create local development secrets without overwriting existing configuration."""
+"""Create deployment secrets without overwriting existing configuration."""
 import base64
 import os
 from pathlib import Path
