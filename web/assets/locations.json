@@ -1,0 +1,247 @@
+[
+  {
+    "id": "dorm-1",
+    "kind": "dorm",
+    "name": "1号宿舍楼",
+    "latitude": 35.281256,
+    "longitude": 113.935975
+  },
+  {
+    "id": "dorm-2",
+    "kind": "dorm",
+    "name": "2号宿舍楼",
+    "latitude": 35.281414,
+    "longitude": 113.936898
+  },
+  {
+    "id": "dorm-3",
+    "kind": "dorm",
+    "name": "3号宿舍楼",
+    "latitude": 35.280948,
+    "longitude": 113.937502
+  },
+  {
+    "id": "dorm-4",
+    "kind": "dorm",
+    "name": "4号宿舍楼",
+    "latitude": 35.280898,
+    "longitude": 113.93489
+  },
+  {
+    "id": "dorm-5",
+    "kind": "dorm",
+    "name": "5号宿舍楼",
+    "latitude": 35.280488,
+    "longitude": 113.935273
+  },
+  {
+    "id": "dorm-6",
+    "kind": "dorm",
+    "name": "6号宿舍楼",
+    "latitude": 35.280521,
+    "longitude": 113.935865
+  },
+  {
+    "id": "dorm-7",
+    "kind": "dorm",
+    "name": "7号宿舍楼",
+    "latitude": 35.280038,
+    "longitude": 113.934687
+  },
+  {
+    "id": "dorm-8",
+    "kind": "dorm",
+    "name": "8号宿舍楼",
+    "latitude": 35.282005,
+    "longitude": 113.940036
+  },
+  {
+    "id": "dorm-9",
+    "kind": "dorm",
+    "name": "9号宿舍楼",
+    "latitude": 35.281728,
+    "longitude": 113.941548
+  },
+  {
+    "id": "dorm-10",
+    "kind": "dorm",
+    "name": "10号宿舍楼",
+    "latitude": 35.279734,
+    "longitude": 113.934301
+  },
+  {
+    "id": "dorm-11",
+    "kind": "dorm",
+    "name": "11号宿舍楼",
+    "latitude": 35.280729,
+    "longitude": 113.933602
+  },
+  {
+    "id": "dorm-12",
+    "kind": "dorm",
+    "name": "12号宿舍楼",
+    "latitude": 35.279763,
+    "longitude": 113.93739
+  },
+  {
+    "id": "dorm-13",
+    "kind": "dorm",
+    "name": "明德苑",
+    "latitude": 35.280301,
+    "longitude": 113.949456
+  },
+  {
+    "id": "dorm-14",
+    "kind": "dorm",
+    "name": "立德苑",
+    "latitude": 35.279109,
+    "longitude": 113.949886
+  },
+  {
+    "id": "dorm-15",
+    "kind": "dorm",
+    "name": "厚德苑",
+    "latitude": 35.27949,
+    "longitude": 113.950048
+  },
+  {
+    "id": "dorm-16",
+    "kind": "dorm",
+    "name": "尚德苑",
+    "latitude": 35.279909,
+    "longitude": 113.950361
+  },
+  {
+    "id": "dorm-17",
+    "kind": "dorm",
+    "name": "兴德苑",
+    "latitude": 35.280291,
+    "longitude": 113.950576
+  },
+  {
+    "id": "dorm-18",
+    "kind": "dorm",
+    "name": "怀德苑",
+    "latitude": 35.2807,
+    "longitude": 113.9507
+  },
+  {
+    "id": "dorm-19",
+    "kind": "dorm",
+    "name": "贤德苑",
+    "latitude": 35.281171,
+    "longitude": 113.95082
+  },
+  {
+    "id": "teaching-20",
+    "kind": "teaching",
+    "name": "1号教学楼",
+    "latitude": 35.281629,
+    "longitude": 113.935099
+  },
+  {
+    "id": "teaching-21",
+    "kind": "teaching",
+    "name": "2号教学楼",
+    "latitude": 35.281283,
+    "longitude": 113.93489
+  },
+  {
+    "id": "teaching-22",
+    "kind": "teaching",
+    "name": "3号教学楼",
+    "latitude": 35.278727,
+    "longitude": 113.942961
+  },
+  {
+    "id": "teaching-23",
+    "kind": "teaching",
+    "name": "4号教学楼",
+    "latitude": 35.278243,
+    "longitude": 113.942916
+  },
+  {
+    "id": "teaching-24",
+    "kind": "teaching",
+    "name": "5号教学楼",
+    "latitude": 35.27777,
+    "longitude": 113.942912
+  },
+  {
+    "id": "teaching-25",
+    "kind": "teaching",
+    "name": "6号教学楼",
+    "latitude": 35.278723,
+    "longitude": 113.941188
+  },
+  {
+    "id": "teaching-26",
+    "kind": "teaching",
+    "name": "7号教学楼",
+    "latitude": 35.278275,
+    "longitude": 113.941088
+  },
+  {
+    "id": "teaching-27",
+    "kind": "teaching",
+    "name": "8号教学楼",
+    "latitude": 35.277809,
+    "longitude": 113.941098
+  },
+  {
+    "id": "teaching-28",
+    "kind": "teaching",
+    "name": "9号教学楼",
+    "latitude": 35.27872,
+    "longitude": 113.940287
+  },
+  {
+    "id": "teaching-29",
+    "kind": "teaching",
+    "name": "10号教学楼",
+    "latitude": 35.278244,
+    "longitude": 113.940262
+  },
+  {
+    "id": "teaching-30",
+    "kind": "teaching",
+    "name": "11号教学楼",
+    "latitude": 35.277796,
+    "longitude": 113.940204
+  },
+  {
+    "id": "teaching-31",
+    "kind": "teaching",
+    "name": "12号教学楼",
+    "latitude": 35.279925,
+    "longitude": 113.9332
+  },
+  {
+    "id": "teaching-32",
+    "kind": "teaching",
+    "name": "弘毅楼",
+    "latitude": 35.278475,
+    "longitude": 113.946059
+  },
+  {
+    "id": "teaching-33",
+    "kind": "teaching",
+    "name": "弘善楼",
+    "latitude": 35.277951,
+    "longitude": 113.945604
+  },
+  {
+    "id": "teaching-34",
+    "kind": "teaching",
+    "name": "弘德楼",
+    "latitude": 35.277322,
+    "longitude": 113.944837
+  },
+  {
+    "id": "teaching-35",
+    "kind": "teaching",
+    "name": "弘文楼",
+    "latitude": 35.277318,
+    "longitude": 113.94621
+  }
+]

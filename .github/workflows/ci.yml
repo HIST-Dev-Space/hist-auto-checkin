@@ -1,0 +1,26 @@
+name: Rust checks
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: hist
+          POSTGRES_PASSWORD: test-only
+          POSTGRES_DB: hist
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U hist -d hist"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgres://hist:test-only@127.0.0.1:5432/hist
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets --locked
