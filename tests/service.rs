@@ -44,6 +44,8 @@ struct Mock {
     school_uid: RwLock<String>,
     school_exchange_forbidden: AtomicBool,
     school_redirect_http: AtomicBool,
+    weixin_already_bound: AtomicBool,
+    qr_token_lists: Mutex<Vec<Vec<String>>>,
 }
 
 async fn mock_server(mock: Arc<Mock>) -> (String, tokio::task::JoinHandle<()>) {
@@ -464,20 +466,32 @@ fn check_post_headers(headers: &HeaderMap, authenticated: bool) {
     }
 }
 
-async fn qr(headers: HeaderMap, Json(body): Json<Value>) -> Json<Value> {
+async fn qr(
+    State(mock): State<Arc<Mock>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
     check_post_headers(&headers, false);
     assert!(body["local_token_list"].is_array());
     assert!(body.get("base_info").is_none());
+    mock.qr_token_lists
+        .lock()
+        .await
+        .push(serde_json::from_value(body["local_token_list"].clone()).unwrap());
     Json(json!({"qrcode":"qrcode-secret","qrcode_img_content":"https://example.test/qr-image"}))
 }
 
 async fn qr_status(
+    State(mock): State<Arc<Mock>>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Json<Value> {
     assert!(!headers.contains_key("authorizationtype"));
     assert_eq!(headers["iLink-App-Id"], "bot");
     assert_eq!(query["qrcode"], "qrcode-secret");
+    if mock.weixin_already_bound.load(Ordering::SeqCst) {
+        return Json(json!({"status":"binded_redirect"}));
+    }
     if query.get("verify_code").map(String::as_str) != Some("1234") {
         return Json(json!({"status":"need_verifycode"}));
     }
@@ -1122,6 +1136,90 @@ async fn bind_weixin(app: &Router, token: &str) {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "confirmed");
     assert!(body.get("bot_token").is_none());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn weixin_rebinding_preserves_existing_binding_until_confirmed(db: PgPool) {
+    let mock = Arc::new(Mock::default());
+    let (base, server) = mock_server(mock.clone()).await;
+    let state = state(db.clone(), &base);
+    let app = app(state.clone());
+    let (user, token) = register(&app, "weixin-rebind").await;
+    bind_weixin(&app, &token).await;
+    let context = state
+        .secrets
+        .encrypt("old-context", &format!("weixin-context:{user}"))
+        .unwrap();
+    sqlx::query("UPDATE weixin_bindings SET context_ciphertext=$1,context_updated_at=now() WHERE user_id=$2")
+        .bind(&context).bind(user).execute(&db).await.unwrap();
+    let before: sqlx::types::Json<Value> =
+        sqlx::query_scalar("SELECT row_to_json(w) FROM weixin_bindings w WHERE user_id=$1")
+            .bind(user)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+
+    mock.weixin_already_bound.store(true, Ordering::SeqCst);
+    let (status, body) = request(&app, "POST", "/api/weixin/login", Some(&token), json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!(
+            "/api/weixin/login/{}/poll",
+            body["session_id"].as_str().unwrap()
+        ),
+        Some(&token),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "binded_redirect");
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/weixin/login",
+        Some(&token),
+        json!({"rebind":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let session = body["session_id"].as_str().unwrap();
+    assert_eq!(
+        *mock.qr_token_lists.lock().await,
+        vec![vec![], vec!["bot-secret".to_owned()], vec![]],
+        "Rebinding must omit the token that caused an already-bound QR response"
+    );
+    let after: sqlx::types::Json<Value> =
+        sqlx::query_scalar("SELECT row_to_json(w) FROM weixin_bindings w WHERE user_id=$1")
+            .bind(user)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(
+        before.0, after.0,
+        "Starting a rebind must keep the old binding intact"
+    );
+
+    mock.weixin_already_bound.store(false, Ordering::SeqCst);
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("/api/weixin/login/{session}/poll"),
+        Some(&token),
+        json!({"verify_code":"1234"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "confirmed");
+    let (_, binding) = request(&app, "GET", "/api/weixin/binding", Some(&token), json!({})).await;
+    assert_eq!(binding["status"], "active");
+    assert_eq!(
+        binding["has_context"], false,
+        "The new binding must require a new inbound context"
+    );
+    server.abort();
 }
 
 async fn wait_status(db: &PgPool, table: &str, id: Uuid, desired: &str) {

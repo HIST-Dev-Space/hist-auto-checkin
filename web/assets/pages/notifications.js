@@ -9,6 +9,7 @@ export async function init() {
   let session = polling.restart();
   let loginId;
   let expiresAt;
+  let hasBinding = false;
   let finished = false;
   const params = new URLSearchParams(location.search);
   const setup = params.get('setup') === '1' && !params.has('manage');
@@ -29,7 +30,9 @@ export async function init() {
     current.clearTimer();
     const binding = await api('/api/weixin/binding', { signal: current.signal });
     if (!current.isCurrent() || finished) return;
+    hasBinding = binding.status !== 'unbound';
     $('#bind-weixin').hidden = false;
+    $('#bind-weixin').textContent = hasBinding ? '重新绑定微信' : '获取二维码';
     if (binding.status === 'active' && binding.has_context) {
       showStatus('微信通知已连接');
       $('#notify-login').hidden = true;
@@ -83,8 +86,24 @@ export async function init() {
         $('#notify-verify-code').focus();
         return;
       }
-      if (['expired', 'verify_code_blocked', 'binded_redirect'].includes(result.status)) {
-        showStatus('二维码已失效，请重新获取');
+      if (result.status === 'binded_redirect') {
+        const binding = await checkBinding(current);
+        if (!current.isCurrent() || finished) return;
+        $('#notify-login').hidden = true;
+        $('#notify-verify').hidden = true;
+        showStatus(
+          binding?.status === 'active'
+            ? '此微信 Bot 已绑定，本次扫码未更换绑定'
+            : '此微信 Bot 已绑定，请重新连接',
+        );
+        return;
+      }
+      if (result.status === 'expired') {
+        showStatus('二维码已过期，请重新获取');
+        return;
+      }
+      if (result.status === 'verify_code_blocked') {
+        showStatus('验证码错误次数过多，请稍后重新获取二维码');
         return;
       }
       showStatus(result.status === 'scaned' ? '请在微信中确认' : '使用微信扫码');
@@ -108,7 +127,7 @@ export async function init() {
       await busy($('#bind-weixin'), '获取中', async () => {
         const result = await api('/api/weixin/login', {
           method: 'POST',
-          body: {},
+          body: { rebind: hasBinding },
           signal: current.signal,
         });
         if (!current.isCurrent()) return;

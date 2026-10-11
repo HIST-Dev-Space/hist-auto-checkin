@@ -694,9 +694,69 @@ async function slowDashboardScenario(browser) {
   console.log('Slow dashboard refreshes stay serial and do not overwrite a newer toggle result');
 }
 
+async function notificationRebindingScenario(browser) {
+  for (const initialStatus of ['binded_redirect', 'expired', 'verify_code_blocked']) {
+    const context = await browser.newContext({viewport:{width:390,height:844},locale:'zh-CN'});
+    const page = await context.newPage(), errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    let binding = initialStatus === 'binded_redirect'
+      ? {status:'active',has_context:true}
+      : {status:'unbound',has_context:false};
+    let starts = 0, polls = 0;
+    await page.route('**/api/**', async route => {
+      const request = route.request(), endpoint = new URL(request.url()).pathname;
+      let result, status = 200;
+      if (endpoint === '/api/me') result = {id:accountId};
+      else if (endpoint === '/api/weixin/binding') result = binding;
+      else if (endpoint === '/api/weixin/login') {
+        assert.equal(request.postDataJSON().rebind, binding.status !== 'unbound');
+        starts++;
+        status = 201;
+        result = {session_id:guestId,qrcode_img_content:'weixin://notifications/rebind-check',expires_at:new Date(Date.now()+300000).toISOString()};
+      } else if (endpoint === `/api/weixin/login/${guestId}/poll`) {
+        polls++;
+        if (starts === 1) result = {status:initialStatus};
+        else {
+          binding = {status:'active',has_context:false};
+          result = {status:'confirmed'};
+        }
+      } else throw new Error(`Unexpected notification API: ${endpoint}`);
+      await route.fulfill({status,contentType:'application/json',body:JSON.stringify(result)});
+    });
+    await page.goto(`${base}/notifications?manage=1`);
+    if (initialStatus === 'binded_redirect') {
+      await page.getByText('微信通知已连接',{exact:true}).waitFor();
+      assert.equal(await page.locator('#bind-weixin').innerText(),'重新绑定微信');
+      await page.locator('#bind-weixin').click();
+    }
+    const expected = {
+      binded_redirect:'此微信 Bot 已绑定，本次扫码未更换绑定',
+      expired:'二维码已过期，请重新获取',
+      verify_code_blocked:'验证码错误次数过多，请稍后重新获取二维码',
+    }[initialStatus];
+    await page.getByText(expected,{exact:true}).waitFor();
+    assert.equal(polls,1,'Terminal QR states must stop QR polling');
+    assert.equal(starts,1,'A terminal QR state must not automatically replace the QR code');
+    if (initialStatus === 'binded_redirect') {
+      assert.equal(await page.locator('#notify-login').isVisible(),false);
+      assert.equal(await page.locator('#bind-weixin').innerText(),'重新绑定微信');
+    }
+    await page.locator('#bind-weixin').click();
+    await page.getByText('请向微信机器人发送一条消息',{exact:true}).waitFor();
+    assert.equal(starts,2);
+    assert.equal(await page.locator('#notify-login').isVisible(),false);
+    binding = {status:'active',has_context:true};
+    await page.getByText('微信通知已连接',{exact:true}).waitFor();
+    assert.equal(await page.locator('#finish-notification').innerText(),'确认');
+    assert.deepEqual(errors,[]);
+    await context.close();
+  }
+  console.log('Weixin rebinding preserves connection state and distinguishes already-bound, expired and blocked scans');
+}
+
 (async () => {
   const options = {headless:true,args:['--no-sandbox']};
   if (process.env.CHROMIUM_PATH) options.executablePath = process.env.CHROMIUM_PATH;
   const browser = await chromium.launch(options);
-  try {await scenario(browser,{width:1440,height:1000},false);await scenario(browser,{width:390,height:844},true);await systemThemeScenario(browser);await failedExchangeScenario(browser);await moduleLoadingScenario(browser);await loginCacheScenario(browser);await qrReuseLimitScenario(browser);await retryableLoginScenario(browser);await pendingLoginPollScenario(browser,false);await pendingLoginPollScenario(browser,true);await pendingLoginPollScenario(browser,true,true);await slowDashboardScenario(browser);} finally {await browser.close();}
+  try {await scenario(browser,{width:1440,height:1000},false);await scenario(browser,{width:390,height:844},true);await systemThemeScenario(browser);await failedExchangeScenario(browser);await moduleLoadingScenario(browser);await loginCacheScenario(browser);await qrReuseLimitScenario(browser);await retryableLoginScenario(browser);await pendingLoginPollScenario(browser,false);await pendingLoginPollScenario(browser,true);await pendingLoginPollScenario(browser,true,true);await slowDashboardScenario(browser);await notificationRebindingScenario(browser);} finally {await browser.close();}
 })().catch(error => {console.error(error);process.exitCode = 1;});

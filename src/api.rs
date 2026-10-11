@@ -505,21 +505,34 @@ async fn jobs(
     ))
 }
 
+#[derive(Deserialize)]
+struct WeixinLoginInput {
+    #[serde(default)]
+    rebind: bool,
+}
+
 async fn start_weixin_login(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
+    Json(input): Json<WeixinLoginInput>,
 ) -> Result<(StatusCode, Json<Value>)> {
     auth::rate_limit(&state, &format!("weixin-login:{user}"), 5).await?;
-    let existing: Option<String> =
-        sqlx::query_scalar("SELECT token_ciphertext FROM weixin_bindings WHERE user_id=$1")
-            .bind(user)
-            .fetch_optional(&state.db)
-            .await?;
-    let tokens = existing
-        .map(|s| state.secrets.decrypt(&s, &format!("weixin-token:{user}")))
-        .transpose()?
-        .into_iter()
-        .collect();
+    // Rebinding requests a fresh login without discarding the current binding.
+    // Existing credentials are replaced only after the new scan is confirmed.
+    let tokens = if input.rebind {
+        Vec::new()
+    } else {
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT token_ciphertext FROM weixin_bindings WHERE user_id=$1")
+                .bind(user)
+                .fetch_optional(&state.db)
+                .await?;
+        existing
+            .map(|s| state.secrets.decrypt(&s, &format!("weixin-token:{user}")))
+            .transpose()?
+            .into_iter()
+            .collect()
+    };
     let qr = state
         .weixin
         .qr_code(tokens)
