@@ -455,7 +455,7 @@ fn task_title(context: ElementRef<'_>, link: ElementRef<'_>) -> String {
             return title;
         }
     }
-    usable_task_title(&link.text().collect::<String>()).unwrap_or_else(|| "签到任务".into())
+    usable_task_title(&link.text().collect::<String>()).unwrap_or_default()
 }
 
 pub fn parse_tasks(base: &Url, course: &str, html: &str) -> Vec<PunchTask> {
@@ -624,7 +624,7 @@ mod tests {
             "正在进行的签到",
         ] {
             let html = format!("<a href='/student/punchw/course/12/30'>{action}</a>");
-            assert_eq!(parse_tasks(&base, "12", &html)[0].title, "签到任务");
+            assert_eq!(parse_tasks(&base, "12", &html)[0].title, "");
         }
     }
 

@@ -911,14 +911,14 @@ async fn checkin_retries_wait_sixty_seconds_and_stop_after_two_retries(db: PgPoo
                 assert!(finished);
                 assert_eq!(notifications, 1);
                 if !opens_on_last_retry {
-                    assert!(message.contains("最多重试 2 次"));
+                    assert_eq!(message, "当前尚未开放签到");
                     let body: String =
                         sqlx::query_scalar("SELECT body FROM notification_outbox WHERE job_id=$1")
                             .bind(job)
                             .fetch_one(&db)
                             .await
                             .unwrap();
-                    assert_eq!(body, format!("Hist-Auto-Checkin\n自动签到\n{message}"));
+                    assert_eq!(body, format!("Hist-Auto-Checkin\n{message}"));
                 }
                 workers::schedule_tick(&state).await.unwrap();
                 assert!(workers::claim_job(&state).await.unwrap().is_none());
@@ -967,7 +967,7 @@ async fn recovered_checkin_at_retry_limit_is_failed_without_another_execution(db
     assert_eq!(status, "failed");
     assert_eq!(attempts, 3);
     assert_eq!(notifications, 1);
-    assert!(message.contains("最多重试 2 次"));
+    assert_eq!(message, "未能完成签到");
     assert!(workers::claim_job(&state).await.unwrap().is_none());
     server.abort();
 }
@@ -1540,7 +1540,7 @@ async fn invalid_school_credentials_pause_rules_and_enqueue_result(db: PgPool) {
         .unwrap();
     assert_eq!(
         body,
-        "Hist-Auto-Checkin\n自动签到\n学校登录已失效，规则已暂停，请重新登录后启用任务"
+        "Hist-Auto-Checkin\n学校登录已失效，规则已暂停，请重新登录后启用任务"
     );
     assert_eq!(mock.submissions.load(Ordering::SeqCst), 0);
     cancel.cancel();

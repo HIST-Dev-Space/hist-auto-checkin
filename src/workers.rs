@@ -72,16 +72,10 @@ pub async fn schedule_tick(state: &AppState) -> anyhow::Result<()> {
     sqlx::query("UPDATE checkin_jobs SET status='pending',lease_token=NULL,lease_until=NULL WHERE status='running' AND lease_until<=now()").execute(&mut *tx).await?;
     sqlx::query("UPDATE checkin_jobs j SET status='cancelled',finished_at=now(),result_message='自动签到已关闭' FROM checkin_schedules s WHERE j.schedule_id=s.id AND NOT s.enabled AND j.status='pending'").execute(&mut *tx).await?;
     sqlx::query("UPDATE school_accounts SET execution_token=NULL,execution_until=NULL WHERE execution_until<=now()").execute(&mut *tx).await?;
-    let exhausted: Vec<(Uuid, Uuid)> = sqlx::query_as("UPDATE checkin_jobs SET status='failed',result_message='已达到重试上限（最多重试 2 次），未能完成签到',finished_at=now() WHERE status='pending' AND attempts>=$1 RETURNING id,user_id")
+    let exhausted: Vec<(Uuid, Uuid, String)> = sqlx::query_as("UPDATE checkin_jobs SET status='failed',result_message=COALESCE(NULLIF(result_message,''),'未能完成签到'),finished_at=now() WHERE status='pending' AND attempts>=$1 RETURNING id,user_id,result_message")
         .bind(MAX_CHECKIN_ATTEMPTS).fetch_all(&mut *tx).await?;
-    for (job, user) in exhausted {
-        enqueue(
-            &mut tx,
-            user,
-            job,
-            "已达到重试上限（最多重试 2 次），未能完成签到",
-        )
-        .await?;
+    for (job, user, message) in exhausted {
+        enqueue(&mut tx, user, job, &message).await?;
     }
     sqlx::query("UPDATE notification_outbox SET status='pending',lease_token=NULL,lease_until=NULL WHERE status='sending' AND lease_until<=now()").execute(&mut *tx).await?;
     sqlx::query("UPDATE notification_outbox SET status='failed',last_error=COALESCE(last_error,'通知已过期') WHERE status='pending' AND expires_at<=now()").execute(&mut *tx).await?;
@@ -107,13 +101,16 @@ async fn enqueue(
     job: Uuid,
     message: &str,
 ) -> anyhow::Result<()> {
-    let title: String = sqlx::query_scalar(
-        "SELECT COALESCE(NULLIF(task_title,''),'自动签到') FROM checkin_jobs WHERE id=$1",
-    )
-    .bind(job)
-    .fetch_one(&mut **tx)
-    .await?;
-    let body = format!("Hist-Auto-Checkin\n{title}\n{message}");
+    let title: String = sqlx::query_scalar("SELECT task_title FROM checkin_jobs WHERE id=$1")
+        .bind(job)
+        .fetch_one(&mut **tx)
+        .await?;
+    let title = title.trim();
+    let body = if title.is_empty() {
+        format!("Hist-Auto-Checkin\n{message}")
+    } else {
+        format!("Hist-Auto-Checkin\n{title}\n{message}")
+    };
     sqlx::query("INSERT INTO notification_outbox(id,user_id,job_id,body) VALUES($1,$2,$3,$4) ON CONFLICT(job_id) DO NOTHING").bind(Uuid::new_v4()).bind(user).bind(job).bind(body).execute(&mut **tx).await?;
     Ok(())
 }
@@ -267,11 +264,7 @@ async fn process_with_client(
             tasks.push(PunchTask {
                 course_id,
                 punch_id,
-                title: if title.trim().is_empty() {
-                    "签到任务".into()
-                } else {
-                    title
-                },
+                title,
                 url,
             });
         }
@@ -281,7 +274,8 @@ async fn process_with_client(
     }
     let title = tasks
         .iter()
-        .map(|task| task.title.as_str())
+        .map(|task| task.title.trim())
+        .filter(|title| !title.is_empty())
         .collect::<Vec<_>>()
         .join("；");
     sqlx::query("UPDATE checkin_jobs SET task_title=$1 WHERE id=$2 AND lease_token=$3 AND status='running' AND lease_until>now()")
@@ -380,11 +374,9 @@ async fn finish_job(state: &AppState, job: &Job, outcome: Outcome) -> anyhow::Re
         Outcome::Done(success, message) => {
             (if success { "succeeded" } else { "failed" }, message, true)
         }
-        Outcome::Retry(message) if job.attempts >= MAX_CHECKIN_ATTEMPTS => (
-            "failed",
-            format!("已达到重试上限（最多重试 2 次）：{message}"),
-            true,
-        ),
+        Outcome::Retry(message) if job.attempts >= MAX_CHECKIN_ATTEMPTS => {
+            ("failed", message, true)
+        }
         Outcome::Retry(message) => ("pending", message, false),
         Outcome::Invalid => {
             sqlx::query("UPDATE school_accounts SET credential_status='invalid' WHERE id=$1")
